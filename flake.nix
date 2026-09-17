@@ -46,11 +46,21 @@
                 };
 
                 # The editor extension: a button on a conversation tab that closes it and calls the tool above.
-                vscode-extension = pkgs.runCommand "vscode-claude-chat-manager" { } ''
-                    target=$out/share/vscode/extensions/beatlink.claude-chat-manager
-                    mkdir -p $target
-                    cp ${./vscode-extension}/package.json ${./vscode-extension}/extension.js $target/
-                '';
+                # home-manager's editor module reads these three to name the extension's directory.
+                vscode-extension =
+                    pkgs.runCommand "vscode-claude-chat-manager"
+                        {
+                            passthru = {
+                                vscodeExtUniqueId = "beatlink.claude-chat-manager";
+                                vscodeExtPublisher = "beatlink";
+                                vscodeExtName = "claude-chat-manager";
+                            };
+                        }
+                        ''
+                            target=$out/share/vscode/extensions/beatlink.claude-chat-manager
+                            mkdir -p $target
+                            cp ${./vscode-extension}/package.json ${./vscode-extension}/extension.js $target/
+                        '';
             });
 
             devShells = forAllSystems (pkgs: {
