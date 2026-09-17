@@ -11,9 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config as config_mod
+from . import render
 from . import vscode
 
-INDEX_VERSION = 3
+INDEX_VERSION = 4
 
 # Records that carry conversation content rather than editor or session bookkeeping.
 CONTENT_TYPES = {"user", "assistant"}
@@ -186,7 +187,8 @@ def scan(path: Path, project_slug: str) -> Conversation:
             if kind == "user":
                 convo.user_messages += 1
                 if not first_user_text:
-                    first_user_text = _text_of(content)[:200]
+                    # A title falls back to what was said first, so the wrappers around it have to go.
+                    first_user_text = render.clean(_text_of(content))[:200]
             else:
                 convo.assistant_messages += 1
                 model = message.get("model")

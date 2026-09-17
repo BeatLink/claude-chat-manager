@@ -9,16 +9,24 @@ from pathlib import Path
 from . import config as config_mod
 
 SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+# The caveat is boilerplate Claude Code wraps around a slash command, and it is dropped whole; an
+# unclosed tag runs to the end of the message.
+CAVEAT = re.compile(r"<local-command-caveat>.*?(?:</local-command-caveat>|\Z)", re.DOTALL)
 COMMAND_TAGS = re.compile(r"</?(command-name|command-message|command-args|local-command-\w+)>")
 
 TOOL_SUMMARY_KEYS = ("command", "file_path", "pattern", "path", "url", "prompt", "query")
 
 
-def _clean(text: str) -> str:
+def clean(text: str) -> str:
     """Strip the wrappers Claude Code injects around user text."""
     text = SYSTEM_REMINDER.sub("", text)
-    text = COMMAND_TAGS.sub("", text)
+    text = CAVEAT.sub("", text)
+    # A space keeps two adjacent tags from running their contents together.
+    text = COMMAND_TAGS.sub(" ", text)
     return text.strip()
+
+
+_clean = clean
 
 
 def _tool_line(block: dict, limit: int) -> str:
