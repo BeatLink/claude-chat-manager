@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import config as config_mod
+from . import leftovers
 from . import memories as memories_mod
 from . import render, store, summarize
 
@@ -167,6 +168,18 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif route == "/api/config":
             self.send_json(asdict(self.state.cfg))
+        elif route == "/api/leftovers":
+            items = leftovers.orphans(cfg=self.state.cfg)
+            self.send_json(
+                {
+                    "rows": list(leftovers.summary(items).values()),
+                    "count": len(items),
+                    "size_human": store.human_size(sum(item.size for item in items)),
+                }
+            )
+        elif route.startswith("/api/scratchpad/"):
+            pad = leftovers.scratchpad_for(route.rsplit("/", 1)[-1], self.state.cfg)
+            self.send_json(leftovers.leftover_dict(pad) if pad else {"path": ""})
         elif route.startswith("/api/transcript/"):
             convo = self.state.find(route.rsplit("/", 1)[-1])
             if not convo:
@@ -282,6 +295,24 @@ class Handler(BaseHTTPRequestHandler):
             summarize.forget(convo.session_id)
             self.state.reload()
             self.send_json({"ok": True, "where": where})
+        elif route in ("/api/scratchpad-open", "/api/scratchpad-delete"):
+            convo = self.state.find(payload.get("session_id", ""))
+            pad = leftovers.scratchpad_for(convo.session_id, self.state.cfg) if convo else None
+            if not pad:
+                self.send_json({"error": "no scratchpad for that conversation"}, 404)
+                return
+            if route.endswith("open"):
+                leftovers.open_in_file_manager(pad.open_path, self.state.cfg)
+                self.send_json({"ok": True, "path": pad.open_path})
+                return
+            self.send_json({"ok": leftovers.remove(pad), "size_human": pad.size_human})
+        elif route == "/api/sweep":
+            kinds = [k for k in (payload.get("kinds") or []) if k in leftovers.KINDS]
+            if not kinds:
+                self.send_json({"error": "no kinds chosen"}, 400)
+                return
+            count, freed = leftovers.remove_all(leftovers.orphans(kinds, self.state.cfg))
+            self.send_json({"ok": True, "count": count, "freed_human": store.human_size(freed)})
         elif route == "/api/prompt":
             which = payload.get("which") or "summary"
             prompt = (payload.get("prompt") or "").strip()

@@ -3,7 +3,7 @@
 const state = { projects: [], summaries: {}, reviews: {}, stats: {}, trash: 0, trashDir: "",
                 scopes: [], checks: {}, memoryStats: {},
                 mode: "conversations", project: null, scope: null, session: null, memory: null,
-                filter: "", promptTab: "summary" };
+                filter: "", promptTab: "summary", scratchpad: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -244,10 +244,9 @@ async function checkMemory(memory, force) {
 }
 
 function askDeleteMemory(memory) {
-    $("deletedetail").textContent =
-        `${memory.name} — ${memory.description || "no description"}. Its line in MEMORY.md goes with it.`;
+    askWhat("Delete this memory?",
+        `${memory.name} — ${memory.description || "no description"}. Its line in MEMORY.md goes with it.`);
     const dialog = $("deletedialog");
-    dialog.showModal();
     $("deleteok").onclick = async () => {
         dialog.close();
         try {
@@ -326,6 +325,7 @@ function drawDetail() {
             <button id="docheck">${review ? "Check again" : "Check outstanding items"}</button>
             <button id="dodelete" class="danger">Delete</button>
         </div>
+        <div id="scratchpad"></div>
         <div id="summary">${summary
             ? markdown(summary.text) + (summary.stale
                 ? '<p class="empty">This summary predates the newest messages.</p>' : "")
@@ -344,6 +344,65 @@ function drawDetail() {
     $("dosummarize").onclick = () => summarize(convo, Boolean(summary));
     $("docheck").onclick = () => check(convo, Boolean(review));
     $("dodelete").onclick = () => askDelete(convo);
+    drawScratchpad(convo);
+}
+
+/* The scratchpad is measured only for the conversation on screen, because walking every one is slow. */
+async function drawScratchpad(convo) {
+    const root = $("scratchpad");
+    if (!root) return;
+    root.innerHTML = '<p class="empty">Looking for a scratchpad…</p>';
+    let pad;
+    try {
+        pad = await api(`/api/scratchpad/${convo.session_id}`);
+    } catch (error) {
+        root.innerHTML = "";
+        return;
+    }
+    if (state.session !== convo.session_id) return;
+    if (!pad.path) {
+        root.innerHTML = '<p class="empty">This session left no scratchpad.</p>';
+        return;
+    }
+    root.innerHTML = `<p class="empty">Scratchpad · ${pad.files} files · ${pad.size_human}<br>
+        ${escapeHtml(pad.open_path)}</p>
+        <div class="actions">
+            <button id="padopen">Open scratchpad</button>
+            <button id="paddelete" class="danger">Delete scratchpad</button>
+        </div>`;
+    $("padopen").onclick = async () => {
+        try {
+            await api("/api/scratchpad-open", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ session_id: convo.session_id }),
+            });
+            toast("Opened in the file manager");
+        } catch (error) {
+            toast(String(error.message || error));
+        }
+    };
+    $("paddelete").onclick = () => askDeleteScratchpad(convo, pad);
+}
+
+function askDeleteScratchpad(convo, pad) {
+    askWhat("Delete this scratchpad?",
+        `${pad.files} files, ${pad.size_human}, at ${pad.open_path}. This is not moved to the trash.`);
+    const dialog = $("deletedialog");
+    $("deleteok").onclick = async () => {
+        dialog.close();
+        try {
+            const data = await api("/api/scratchpad-delete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ session_id: convo.session_id }),
+            });
+            toast(data.ok ? `Deleted the scratchpad, freeing ${data.size_human}` : "Nothing could be removed");
+            drawScratchpad(convo);
+        } catch (error) {
+            toast(String(error.message || error));
+        }
+    };
 }
 
 /* Bold, code and italics inside one line, without the block handling. */
@@ -395,10 +454,9 @@ async function summarize(convo, force) {
 }
 
 function askDelete(convo) {
-    $("deletedetail").textContent =
-        `${convo.display_title} — ${convo.messages} messages, ${convo.size_human}.`;
+    askWhat("Delete this conversation?",
+        `${convo.display_title} — ${convo.messages} messages, ${convo.size_human}.`);
     const dialog = $("deletedialog");
-    dialog.showModal();
     $("deleteok").onclick = async () => {
         dialog.close();
         try {
@@ -414,6 +472,13 @@ function askDelete(convo) {
             toast(String(error.message || error));
         }
     };
+}
+
+/* One confirm dialog serves conversations, memories and scratchpads, so it is retitled each time. */
+function askWhat(heading, detail) {
+    $("deleteheading").textContent = heading;
+    $("deletedetail").textContent = detail;
+    $("deletedialog").showModal();
 }
 
 $("deletecancel").onclick = () => $("deletedialog").close();
@@ -454,6 +519,44 @@ $("showtrash").onclick = async () => {
     $("trashdialog").showModal();
 };
 $("trashclose").onclick = () => $("trashdialog").close();
+
+$("showleftovers").onclick = async () => {
+    $("leftoverlist").innerHTML = '<p class="empty">Measuring…</p>';
+    $("leftoverdialog").showModal();
+    try {
+        const data = await api("/api/leftovers");
+        $("leftoverhint").textContent = data.count
+            ? `${data.count} left behind by sessions whose conversation is gone · ${data.size_human}`
+            : "Nothing was left behind.";
+        $("leftoverlist").innerHTML = data.rows.map((row) => `<div class="option">
+            <input type="checkbox" id="kind-${row.kind}" value="${row.kind}" ${row.count ? "" : "disabled"}>
+            <label for="kind-${row.kind}"><strong>${escapeHtml(row.label)}</strong>
+              <span class="count">${row.count} · ${row.size_human}</span>
+              <div class="sub">${escapeHtml(row.help)}</div></label></div>`).join("");
+    } catch (error) {
+        $("leftoverlist").innerHTML = `<p class="empty">${escapeHtml(String(error.message || error))}</p>`;
+    }
+};
+$("leftoverclose").onclick = () => $("leftoverdialog").close();
+$("leftoversweep").onclick = async () => {
+    const kinds = [...document.querySelectorAll("#leftoverlist input:checked")].map((box) => box.value);
+    if (!kinds.length) { toast("Tick what should go first"); return; }
+    const button = $("leftoversweep");
+    button.disabled = true;
+    try {
+        const data = await api("/api/sweep", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ kinds }),
+        });
+        toast(`Removed ${data.count}, freeing ${data.freed_human}`);
+        $("leftoverdialog").close();
+    } catch (error) {
+        toast(String(error.message || error));
+    } finally {
+        button.disabled = false;
+    }
+};
 $("promptcancel").onclick = () => $("promptdialog").close();
 $("promptdefault").onclick = async () => {
     await api("/api/prompt", {

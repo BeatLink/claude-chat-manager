@@ -12,7 +12,7 @@ the same data and share the same settings:
 | `claude-chat-manager` (or `ccm`) | Textual terminal interface |
 | `claude-chat-manager gtk` | GTK4 / libadwaita window |
 | `claude-chat-manager web` | local web interface at `http://127.0.0.1:8765` |
-| `ccm list`, `ccm summarize`, `ccm review`, `ccm delete`, `ccm trash`, `ccm prune` | plain command line |
+| `ccm list`, `ccm summarize`, `ccm review`, `ccm delete`, `ccm trash`, `ccm prune`, `ccm sweep` | plain command line |
 | `ccm memory list\|show\|check\|delete\|health` | the same for memory files |
 
 ## Summarizing
@@ -62,11 +62,50 @@ The check never edits anything. It runs from an empty working directory with the
 the project's own hooks do not fire, and it asks for its answer as JSON so the tool can read the
 verdict rather than guess at it.
 
+## Scratchpads and what else a session leaves behind
+
+A conversation is not the only thing a session writes. It also gets a **scratchpad** — a temporary
+directory outside the project, for intermediate files that do not belong in the working tree — plus
+an environment directory, snapshots of every file it edited, and an entry in Claude Code's session
+registry. None of that is cleaned up when the conversation goes, and the scratchpads in particular
+add up to gigabytes.
+
+Every frontend shows the open conversation's scratchpad under its metadata — how many files and how
+large — with **Open scratchpad**, which hands the directory to your desktop file manager, and
+**Delete scratchpad**, which removes it outright rather than trashing it. In the terminal those are
+`o` and `x`. On the command line:
+
+```sh
+ccm scratchpad 3f8a2c1b            # where it is and what it holds
+ccm scratchpad 3f8a2c1b --open     # show it in the file manager
+ccm scratchpad 3f8a2c1b --delete   # remove it
+```
+
+The **Leftovers** button — `l` in the terminal — measures everything left behind by sessions whose
+conversation no longer exists, and offers the four kinds separately:
+
+| Kind | What it is |
+| --- | --- |
+| Scratchpads | the temporary files a session wrote outside the project |
+| Session environments | the per-session environment directory |
+| File history | the snapshots taken before a session edited a file |
+| Session records | the registry entry for a session whose process has gone |
+
+A conversation sitting in the trash still counts as existing, so restoring it gets its scratchpad
+back. The same sweep on the command line, which reports before it removes anything:
+
+```sh
+ccm sweep                                    # what is there, per kind
+ccm sweep --scratchpads --session-env        # remove those two kinds
+ccm sweep --all -y                           # remove every kind without asking
+```
+
 ## Deleting
 
 Deleting moves the transcript to `~/.local/share/claude-chat-manager/trash/` rather than destroying it, so a
 mistake is recoverable. Set `trash_on_delete` to `false`, or pass `--purge` on the command line, to
-delete outright. `ccm prune` removes project directories that no longer hold any conversations.
+delete outright. `ccm prune` removes project directories that no longer hold any conversations. Scratchpads are never
+trashed — there is no undo for those.
 
 ## Installing
 
@@ -95,7 +134,9 @@ standard library.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `projects_dir` | `~/.claude/projects` | where transcripts are read from |
+| `claude_dir` | `~/.claude` | where scratchpads and the other leftovers are looked for |
 | `claude_bin` | `claude` | the CLI used for summaries |
+| `file_manager` | *(xdg-open)* | the command a scratchpad is opened with |
 | `model` | *(empty)* | model for summaries, empty for the CLI default |
 | `summary_prompt` | see above | the prompt sent with every transcript |
 | `review_prompt` | see above | the prompt for the outstanding-items check |

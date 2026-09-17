@@ -13,9 +13,10 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
 
 from . import config as config_mod  # noqa: E402
+from . import leftovers  # noqa: E402
 from . import memories as memories_mod  # noqa: E402
 from . import store, summarize  # noqa: E402
 
@@ -83,6 +84,8 @@ class Window(Adw.ApplicationWindow):
         self.mode = "conversations"
         self.open_id: str | None = None
         self.open_memory: str | None = None
+        self.scratchpad: leftovers.Leftover | None = None
+        self.scratchpad_id: str | None = None
         self.filter_text = ""
         self.busy = False
         self.selecting = False
@@ -125,6 +128,13 @@ class Window(Adw.ApplicationWindow):
         prompts.connect("clicked", lambda *_: self.edit_prompts())
         header.pack_end(prompts)
 
+        sweep = Gtk.Button(
+            icon_name="edit-clear-all-symbolic",
+            tooltip_text="What sessions with no conversation left behind",
+        )
+        sweep.connect("clicked", lambda *_: self.show_leftovers())
+        header.pack_end(sweep)
+
         rescan = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Rescan transcripts")
         rescan.connect("clicked", lambda *_: self.reload(refresh=True))
         header.pack_end(rescan)
@@ -149,6 +159,20 @@ class Window(Adw.ApplicationWindow):
         self.summary_label = Gtk.Label(
             xalign=0, yalign=0, wrap=True, selectable=True, use_markup=True
         )
+        self.scratchpad_label = Gtk.Label(
+            xalign=0, hexpand=True, selectable=True, ellipsize=Pango.EllipsizeMode.MIDDLE
+        )
+        self.scratchpad_label.add_css_class("dim-label")
+        self.scratchpad_open = Gtk.Button(label="Open scratchpad", valign=Gtk.Align.CENTER)
+        self.scratchpad_open.connect("clicked", lambda *_: self.open_scratchpad())
+        self.scratchpad_delete = Gtk.Button(
+            label="Delete scratchpad", valign=Gtk.Align.CENTER, css_classes=["destructive-action"]
+        )
+        self.scratchpad_delete.connect("clicked", lambda *_: self.confirm_delete_scratchpad())
+        self.scratchpad_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for widget in (self.scratchpad_label, self.scratchpad_open, self.scratchpad_delete):
+            self.scratchpad_box.append(widget)
+
         self.verdict_label = Gtk.Label(xalign=0, wrap=True, use_markup=True)
         self.review_label = Gtk.Label(
             xalign=0, yalign=0, wrap=True, selectable=True, use_markup=True
@@ -167,6 +191,7 @@ class Window(Adw.ApplicationWindow):
         for widget in (
             self.title_label,
             self.meta_label,
+            self.scratchpad_box,
             self.summary_label,
             Gtk.Separator(),
             self.check_heading,
@@ -370,12 +395,14 @@ class Window(Adw.ApplicationWindow):
             return
         convo = self.opened()
         if convo is None:
+            self.scratchpad_box.set_visible(False)
             self.title_label.set_text("")
             self.meta_label.set_text("")
             self.summary_label.set_markup("<i>No conversation selected.</i>")
             self.verdict_label.set_markup("")
             self.review_label.set_markup("")
             return
+        self.show_scratchpad(convo)
         tokens = convo.input_tokens + convo.output_tokens
         bits = [
             convo.project_path,
@@ -421,6 +448,7 @@ class Window(Adw.ApplicationWindow):
 
     def show_memory_detail(self) -> None:
         """Update the right hand pane for the open memory."""
+        self.scratchpad_box.set_visible(False)
         memory = self.opened_memory()
         if memory is None:
             self.title_label.set_text("")
@@ -553,6 +581,153 @@ class Window(Adw.ApplicationWindow):
         self.toast(message)
         self.fill_middle()
         return False
+
+    def show_scratchpad(self, convo) -> None:
+        """Measure the open conversation's scratchpad off the UI thread and show what it holds."""
+        session_id = convo.session_id
+        if self.scratchpad_id == session_id:
+            self.scratchpad_box.set_visible(bool(self.scratchpad))
+            return
+        self.scratchpad_box.set_visible(False)
+        self.scratchpad = None
+
+        def worker() -> None:
+            pad = leftovers.scratchpad_for(session_id, self.cfg)
+            GLib.idle_add(self.scratchpad_measured, session_id, pad)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def scratchpad_measured(self, session_id: str, pad) -> bool:
+        """Show a measured scratchpad, unless the selection moved on while it was being counted."""
+        convo = self.opened()
+        if not convo or convo.session_id != session_id:
+            return False
+        self.scratchpad_id = session_id
+        self.scratchpad = pad
+        if not pad:
+            return False
+        self.scratchpad_label.set_text(f"Scratchpad · {pad.files} files · {pad.size_human}")
+        self.scratchpad_label.set_tooltip_text(pad.open_path)
+        self.scratchpad_box.set_visible(True)
+        return False
+
+    def open_scratchpad(self) -> None:
+        """Show the open conversation's scratchpad in the desktop file manager."""
+        pad = self.scratchpad
+        if not pad:
+            return
+        try:
+            leftovers.open_in_file_manager(pad.open_path, self.cfg)
+        except OSError as exc:
+            self.toast(f"Could not open it: {exc}")
+            return
+        self.toast("Opened in the file manager")
+
+    def confirm_delete_scratchpad(self) -> None:
+        """Ask before deleting the open conversation's scratchpad, which is not trashed."""
+        pad = self.scratchpad
+        if not pad:
+            return
+        dialog = Adw.AlertDialog(
+            heading="Delete this scratchpad?",
+            body=f"{pad.files} files, {pad.size_human}\n\n{pad.open_path}\n\n"
+            "It is deleted outright rather than moved to the trash.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.connect("response", self.delete_scratchpad_answered, pad)
+        dialog.present(self)
+
+    def delete_scratchpad_answered(self, _dialog, response: str, pad) -> None:
+        """Carry out a confirmed deletion of the scratchpad that was shown."""
+        if response != "delete":
+            return
+        gone = leftovers.remove(pad)
+        self.toast(f"Deleted, freeing {pad.size_human}" if gone else "Nothing could be removed")
+        self.scratchpad_box.set_visible(False)
+        self.scratchpad = None
+        self.scratchpad_id = None
+
+    def show_leftovers(self) -> None:
+        """Offer the four kinds of leftover for deletion, once they have been measured."""
+        dialog = Adw.Dialog(title="Leftovers", content_width=640, content_height=520)
+        hint = Gtk.Label(
+            label="Measuring what sessions with no conversation left behind…",
+            xalign=0,
+            wrap=True,
+            css_classes=["dim-label"],
+        )
+        group = Adw.PreferencesGroup()
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=16,
+            margin_bottom=16,
+            margin_start=16,
+            margin_end=16,
+        )
+        box.append(hint)
+        box.append(group)
+
+        header = Adw.HeaderBar()
+        remove = Gtk.Button(label="Delete selected", css_classes=["destructive-action"], sensitive=False)
+        header.pack_end(remove)
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(header)
+        toolbar.set_content(Gtk.ScrolledWindow(child=box))
+        dialog.set_child(toolbar)
+        dialog.present(self)
+
+        boxes: dict[str, Gtk.CheckButton] = {}
+
+        def measured(rows: dict, count: int, total: int) -> bool:
+            hint.set_text(
+                f"{count} left behind by sessions with no conversation · {store.human_size(total)}"
+                if count
+                else "Nothing was left behind."
+            )
+            for kind, row in rows.items():
+                check = Gtk.CheckButton(valign=Gtk.Align.CENTER, sensitive=bool(row["count"]))
+                check.connect("toggled", lambda *_: remove.set_sensitive(
+                    any(b.get_active() for b in boxes.values())
+                ))
+                boxes[kind] = check
+                item = Adw.ActionRow(
+                    title=GLib.markup_escape_text(row["label"]),
+                    subtitle=GLib.markup_escape_text(f"{row['count']} · {row['help']}"),
+                    activatable_widget=check,
+                )
+                item.add_prefix(check)
+                item.add_suffix(Gtk.Label(label=row["size_human"], css_classes=["dim-label"]))
+                group.add(item)
+            return False
+
+        def worker() -> None:
+            items = leftovers.orphans(cfg=self.cfg)
+            rows = leftovers.summary(items)
+            GLib.idle_add(measured, rows, len(items), sum(item.size for item in items))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def on_remove(*_args) -> None:
+            kinds = [kind for kind, check in boxes.items() if check.get_active()]
+            remove.set_sensitive(False)
+            remove.set_label("Deleting…")
+
+            def sweeper() -> None:
+                count, freed = leftovers.remove_all(leftovers.orphans(kinds, self.cfg))
+                GLib.idle_add(swept, count, freed)
+
+            def swept(count: int, freed: int) -> bool:
+                self.toast(f"Removed {count}, freeing {store.human_size(freed)}")
+                dialog.close()
+                return False
+
+            threading.Thread(target=sweeper, daemon=True).start()
+
+        remove.connect("clicked", on_remove)
 
     def confirm_delete(self) -> None:
         """Ask before deleting whatever is open."""

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from claude_chat_manager import config as config_mod
+from claude_chat_manager import leftovers
 from claude_chat_manager import memories
 from claude_chat_manager import render, store, summarize
 
@@ -436,3 +437,85 @@ def test_memory_verdicts_read_as_words():
     check = summarize.Review(session_id="x", text="{}", verdict="stale")
     assert check.label == "out of date"
     assert summarize.Review(session_id="x", text="{}", verdict="current").label == "still true"
+
+
+@pytest.fixture
+def leftover_workspace(tmp_path, workspace, monkeypatch):
+    """A Claude directory holding leftovers for one live session and one that is gone."""
+    live = "11111111-2222-3333-4444-555555555555"
+    gone = "99999999-8888-7777-6666-555555555555"
+    home = tmp_path / "claude"
+    for session in (live, gone):
+        pad = home / "tmp" / "claude-1000" / "-tmp-example" / session / "scratchpad"
+        pad.mkdir(parents=True)
+        (pad / "notes.md").write_text("x" * 100)
+        (home / "session-env" / session).mkdir(parents=True)
+        history = home / "file-history" / session
+        history.mkdir(parents=True)
+        (history / "before.txt").write_text("y" * 50)
+    (home / "tmp" / "claude-1000" / "bundled-skills").mkdir(parents=True)
+    records = home / "sessions"
+    records.mkdir(parents=True)
+    (records / "999999.json").write_text(json.dumps({"pid": 999999, "sessionId": gone}))
+    (records / "999999.abc.key").write_text("k")
+    return config_mod.Config(projects_dir=str(workspace), claude_dir=str(home))
+
+
+def test_leftovers_are_found_for_every_kind(leftover_workspace):
+    found = leftovers.collect(cfg=leftover_workspace)
+    assert {item.kind for item in found} == {
+        "scratchpad",
+        "session-env",
+        "file-history",
+        "session-record",
+    }
+    assert sum(1 for item in found if item.kind == "scratchpad") == 2
+
+
+def test_only_sessions_with_no_conversation_are_orphans(leftover_workspace):
+    found = leftovers.orphans(["scratchpad", "file-history"], leftover_workspace)
+    assert [item.session_id for item in found] == [
+        "99999999-8888-7777-6666-555555555555"
+    ] * 2
+
+
+def test_a_trashed_conversation_keeps_its_leftovers(cfg, leftover_workspace):
+    convo = store.find(store.load_projects(cfg), "11111111")
+    store.delete(convo, cfg)
+    assert "11111111-2222-3333-4444-555555555555" in leftovers.known_sessions(leftover_workspace)
+
+
+def test_the_scratchpad_of_one_conversation_is_measured(leftover_workspace):
+    pad = leftovers.scratchpad_for("11111111-2222-3333-4444-555555555555", leftover_workspace)
+    assert pad and pad.files == 1 and pad.size == 100
+    assert pad.open_path.endswith("/scratchpad")
+
+
+def test_hard_links_are_counted_once(tmp_path):
+    directory = tmp_path / "pad"
+    directory.mkdir()
+    (directory / "one").write_text("z" * 80)
+    (directory / "two").hardlink_to(directory / "one")
+    size, files, _mtime = leftovers.measure(directory)
+    assert files == 2 and size == 80
+
+
+def test_a_dead_session_record_takes_its_key_file(leftover_workspace):
+    found = [i for i in leftovers.collect(["session-record"], leftover_workspace) if i.pid == 999999]
+    assert len(found) == 1 and len(found[0].paths) == 2
+    assert leftovers.remove(found[0])
+    assert not found[0].exists
+
+
+def test_removing_leftovers_reports_what_was_freed(leftover_workspace):
+    found = leftovers.orphans(["scratchpad"], leftover_workspace)
+    count, freed = leftovers.remove_all(found)
+    assert count == 1 and freed == 100
+    assert not leftovers.orphans(["scratchpad"], leftover_workspace)
+
+
+def test_the_sweep_summary_has_a_row_per_kind(leftover_workspace):
+    rows = leftovers.summary(leftovers.orphans(cfg=leftover_workspace))
+    assert list(rows) == list(leftovers.KINDS)
+    assert rows["scratchpad"]["count"] == 1
+    assert rows["session-env"]["count"] == 1

@@ -48,7 +48,7 @@ main > section:last-child { border-right: none; }
 #detail { padding: 22px 26px; }
 #detail h2 { margin: 0 0 6px; font-size: 19px; }
 #meta { color: var(--muted); font-size: 12.5px; margin-bottom: 18px; word-break: break-all; }
-#actions { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+#actions, .actions { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
 #summary { max-width: 62ch; }
 #summary h3 { font-size: 14px; margin: 18px 0 6px; }
 #summary ul { padding-left: 20px; margin: 6px 0; }
@@ -66,6 +66,10 @@ main > section:last-child { border-right: none; }
 #summary code { background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
                 padding: 0 4px; font-size: 12.5px; }
 .empty { color: var(--muted); font-style: italic; }
+.option { display: flex; gap: 10px; align-items: baseline; padding: 10px 2px;
+          border-bottom: 1px solid var(--line); }
+.option label { flex: 1; cursor: pointer; }
+.option .sub { color: var(--muted); font-size: 12px; }
 dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: inherit;
          padding: 0; max-width: 720px; width: 90%; box-shadow: 0 10px 40px rgba(0,0,0,.25); }
 dialog::backdrop { background: rgba(0,0,0,.45); }
@@ -89,6 +93,7 @@ textarea { width: 100%; min-height: 260px; font: 13px/1.5 ui-monospace, "SF Mono
     <button id="rescan">Rescan</button>
     <button id="editprompt">Prompts</button>
     <button id="showtrash">Trash</button>
+    <button id="showleftovers">Leftovers</button>
     <span id="stats" title="✓ summarized · ✔!? checked · ● live · ▣ archived"></span>
 </header>
 
@@ -129,9 +134,21 @@ textarea { width: 100%; min-height: 260px; font: 13px/1.5 ui-monospace, "SF Mono
     </div>
 </dialog>
 
+<dialog id="leftoverdialog">
+    <div class="dialog-body">
+        <h3>What past sessions left behind</h3>
+        <p class="empty" id="leftoverhint">Files kept outside the transcript by sessions whose conversation is gone.</p>
+        <div id="leftoverlist"></div>
+    </div>
+    <div class="dialog-foot">
+        <button id="leftoverclose">Close</button>
+        <button id="leftoversweep" class="danger">Delete selected</button>
+    </div>
+</dialog>
+
 <dialog id="deletedialog">
     <div class="dialog-body">
-        <h3>Delete this conversation?</h3>
+        <h3 id="deleteheading">Delete this conversation?</h3>
         <p id="deletedetail"></p>
     </div>
     <div class="dialog-foot">

@@ -9,6 +9,7 @@ from pathlib import Path
 from dataclasses import asdict
 
 from . import config as config_mod
+from . import leftovers
 from . import memories as memories_mod
 from . import store, summarize
 
@@ -164,6 +165,64 @@ def cmd_prune(args, cfg) -> int:
             print("left alone")
             return 0
     print(f"removed {len(store.prune_empty(cfg))}")
+    return 0
+
+
+def cmd_scratchpad(args, cfg) -> int:
+    """Show, open or delete the scratchpad one conversation's session wrote."""
+    projects = store.load_projects(cfg)
+    convo = store.find(projects, args.session)
+    if not convo:
+        return _fail(f"no conversation matching {args.session!r}")
+    pad = leftovers.scratchpad_for(convo.session_id, cfg)
+    if not pad:
+        print(f"{convo.display_title}\n  no scratchpad was left for this session")
+        return 0
+    print(f"{convo.display_title}\n  {pad.open_path}\n  {pad.files} files, {pad.size_human}")
+    if args.open:
+        leftovers.open_in_file_manager(pad.open_path, cfg)
+        print("  opened in the file manager")
+    if args.delete:
+        if not args.yes:
+            if input("delete this scratchpad for good? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("left alone")
+                return 0
+        print("deleted" if leftovers.remove(pad) else "nothing could be removed")
+    return 0
+
+
+# The sweep flags, in the order they are listed, and the kind of leftover each one selects.
+SWEEP_FLAGS = {
+    "scratchpads": "scratchpad",
+    "session_env": "session-env",
+    "file_history": "file-history",
+    "sessions": "session-record",
+}
+
+
+def cmd_sweep(args, cfg) -> int:
+    """Report what past sessions left behind, and delete the kinds that were asked for."""
+    chosen = [kind for flag, kind in SWEEP_FLAGS.items() if getattr(args, flag, False)]
+    if args.all:
+        chosen = list(leftovers.KINDS)
+    items = leftovers.orphans(chosen or None, cfg)
+    rows = leftovers.summary(items)
+    for kind in chosen or list(leftovers.KINDS):
+        row = rows[kind]
+        print(f"  {row['label']:22} {row['count']:5}  {row['size_human']:>9}  {row['help']}")
+    total = sum(item.size for item in items)
+    print(f"\n{len(items)} left behind by sessions with no conversation, {store.human_size(total)}")
+    if not chosen:
+        print("name a kind to remove it: --scratchpads --session-env --file-history --sessions --all")
+        return 0
+    if not items:
+        return 0
+    if not args.yes:
+        if input(f"delete all {len(items)} for good? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("left alone")
+            return 0
+    count, freed = leftovers.remove_all(items)
+    print(f"removed {count}, freeing {store.human_size(freed)}")
     return 0
 
 
@@ -342,6 +401,22 @@ def build_parser() -> argparse.ArgumentParser:
     prune = subs.add_parser("prune", help="remove project directories with no conversations left")
     prune.add_argument("-y", "--yes", action="store_true", help="do not ask first")
     prune.set_defaults(func=cmd_prune)
+
+    scratchpad = subs.add_parser("scratchpad", help="show, open or delete a conversation's scratchpad")
+    scratchpad.add_argument("session", help="session id or unique prefix")
+    scratchpad.add_argument("-o", "--open", action="store_true", help="open it in the file manager")
+    scratchpad.add_argument("-d", "--delete", action="store_true", help="delete it for good")
+    scratchpad.add_argument("-y", "--yes", action="store_true", help="do not ask first")
+    scratchpad.set_defaults(func=cmd_scratchpad)
+
+    sweep = subs.add_parser("sweep", help="remove what sessions with no conversation left behind")
+    sweep.add_argument("--scratchpads", action="store_true", help="the temporary files they wrote")
+    sweep.add_argument("--session-env", action="store_true", help="their environment directories")
+    sweep.add_argument("--file-history", action="store_true", help="their file edit snapshots")
+    sweep.add_argument("--sessions", action="store_true", help="registry entries for dead processes")
+    sweep.add_argument("--all", action="store_true", help="every kind at once")
+    sweep.add_argument("-y", "--yes", action="store_true", help="do not ask first")
+    sweep.set_defaults(func=cmd_sweep)
 
     memory = subs.add_parser("memory", help="list, show, check or delete the memory files")
     memory_subs = memory.add_subparsers(dest="memory_action")

@@ -110,7 +110,9 @@ class Config:
     """Everything the user can tune, with defaults that work unconfigured."""
 
     projects_dir: str = str(Path.home() / ".claude" / "projects")
+    claude_dir: str = str(Path.home() / ".claude")
     claude_bin: str = "claude"
+    file_manager: str = ""
     model: str = ""
     summary_prompt: str = DEFAULT_SUMMARY_PROMPT
     summary_timeout: int = 600

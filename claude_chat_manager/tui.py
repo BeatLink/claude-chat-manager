@@ -10,6 +10,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Checkbox,
     DataTable,
     Footer,
     Header,
@@ -23,6 +24,7 @@ from textual.widgets import (
 )
 
 from . import config as config_mod
+from . import leftovers
 from . import memories as memories_mod
 from . import store, summarize
 
@@ -48,6 +50,61 @@ class Confirm(ModalScreen[bool]):
     def pressed(self, event: Button.Pressed) -> None:
         """Close the dialog with the pressed answer."""
         self.dismiss(event.button.id == "yes")
+
+
+class Leftovers(ModalScreen[list[str] | None]):
+    """The four kinds of leftover, each offered for deletion once it has been measured."""
+
+    BINDINGS = [("escape", "dismiss(None)", "Cancel")]
+
+    def __init__(self, cfg: config_mod.Config) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("What sessions with no conversation left behind", id="question")
+            yield Static("Measuring…", id="detail")
+            yield Vertical(id="kinds")
+            with Horizontal(id="buttons"):
+                yield Button("Delete selected", variant="error", id="yes", disabled=True)
+                yield Button("Cancel", variant="primary", id="no")
+
+    def on_mount(self) -> None:
+        """Start measuring as soon as the screen is up."""
+        self.measure()
+
+    @work(thread=True)
+    def measure(self) -> None:
+        """Walk the leftovers off the UI thread, which takes a moment on a full disk."""
+        items = leftovers.orphans(cfg=self.cfg)
+        self.app.call_from_thread(
+            self.measured, leftovers.summary(items), len(items), sum(i.size for i in items)
+        )
+
+    def measured(self, rows: dict, count: int, total: int) -> None:
+        """Show one checkbox per kind, disabled where there is nothing to delete."""
+        self.query_one("#detail", Static).update(
+            f"{count} left behind · {store.human_size(total)}" if count else "Nothing was left behind."
+        )
+        container = self.query_one("#kinds", Vertical)
+        for kind, row in rows.items():
+            container.mount(
+                Checkbox(
+                    f"{row['label']} — {row['count']}, {row['size_human']} — {row['help']}",
+                    name=kind,
+                    disabled=not row["count"],
+                )
+            )
+        self.query_one("#yes", Button).disabled = not count
+
+    @on(Button.Pressed)
+    def pressed(self, event: Button.Pressed) -> None:
+        """Hand back the ticked kinds, or nothing at all."""
+        if event.button.id != "yes":
+            self.dismiss(None)
+            return
+        self.dismiss([box.name for box in self.query(Checkbox) if box.value and box.name])
 
 
 class PromptEditor(ModalScreen[str | None]):
@@ -112,6 +169,7 @@ class ChatManager(App):
               max-height: 80%; margin: 2 4; }
     #question { text-style: bold; padding-bottom: 1; }
     #prompt { height: 20; margin-bottom: 1; }
+    #kinds { height: auto; margin-bottom: 1; }
     #buttons { height: auto; align: right middle; }
     #buttons Button { margin-left: 2; }
     """
@@ -120,6 +178,9 @@ class ChatManager(App):
         ("s", "summarize", "Summarize"),
         ("c", "check", "Check items"),
         ("d", "delete", "Delete"),
+        ("o", "scratchpad", "Scratchpad"),
+        ("x", "delete_scratchpad", "Del scratchpad"),
+        ("l", "leftovers", "Leftovers"),
         ("p", "prompt", "Prompt"),
         ("slash", "filter", "Filter"),
         ("r", "refresh", "Rescan"),
@@ -140,6 +201,8 @@ class ChatManager(App):
         self.shown_memories: list[memories_mod.Memory] = []
         self.open_id: str | None = None
         self.open_memory: str | None = None
+        self.scratchpad: leftovers.Leftover | None = None
+        self.scratchpad_id: str | None = None
         self.mode = "conversations"
         self.filter_text = ""
         self.busy = False
@@ -384,14 +447,21 @@ class ChatManager(App):
             body.update("*No conversation selected.*")
             return
         tokens = convo.input_tokens + convo.output_tokens
-        meta.update(
-            f"{convo.display_title}\n{convo.project_path}\n"
+        lines = [
+            convo.display_title,
+            convo.project_path,
             f"{convo.modified:%Y-%m-%d %H:%M} · {convo.messages} messages · "
             f"{convo.tool_calls} tool calls · {store.human_size(convo.size)}"
             + (f" · {tokens:,} tokens" if tokens else "")
-            + (f" · branch {convo.git_branch}" if convo.git_branch else "")
-            + (f"\n{store.STATE_WORDS[convo.state].capitalize()}." if convo.state else "")
-        )
+            + (f" · branch {convo.git_branch}" if convo.git_branch else ""),
+        ]
+        if convo.state:
+            lines.append(f"{store.STATE_WORDS[convo.state].capitalize()}.")
+        pad = self.scratchpad
+        if pad and pad.session_id == convo.session_id:
+            lines.append(f"Scratchpad: {pad.files} files, {pad.size_human} — o opens it, x deletes it")
+        meta.update("\n".join(lines))
+        self.measure_scratchpad(convo.session_id)
         if self.busy:
             return
         body.update(self.detail_markdown(convo))
@@ -439,6 +509,8 @@ class ChatManager(App):
                 self.show_detail()
         elif key != self.open_id:
             self.open_id = key
+            self.scratchpad = None
+            self.scratchpad_id = None
             self.show_detail()
 
     @on(Input.Changed, "#filter")
@@ -609,6 +681,77 @@ class ChatManager(App):
         self.open_memory = None
         self.notify("Deleted" if where == "deleted" else f"Moved to {Path(where).name}")
         self.load()
+
+    @work(thread=True, exclusive=True, group="scratchpad")
+    def measure_scratchpad(self, session_id: str) -> None:
+        """Measure one conversation's scratchpad off the UI thread, since walking it can be slow."""
+        if self.scratchpad_id == session_id:
+            return
+        pad = leftovers.scratchpad_for(session_id, self.cfg)
+        self.call_from_thread(self.scratchpad_measured, session_id, pad)
+
+    def scratchpad_measured(self, session_id: str, pad) -> None:
+        """Redraw with the measured scratchpad, unless the cursor has moved on."""
+        convo = self.opened()
+        if not convo or convo.session_id != session_id:
+            return
+        self.scratchpad = pad
+        self.scratchpad_id = session_id
+        if pad:
+            self.show_detail()
+
+    def action_scratchpad(self) -> None:
+        """Show the open conversation's scratchpad in the desktop file manager."""
+        if not self.scratchpad:
+            self.notify("This session left no scratchpad.")
+            return
+        try:
+            leftovers.open_in_file_manager(self.scratchpad.open_path, self.cfg)
+        except OSError as exc:
+            self.notify(f"Could not open it: {exc}", severity="error")
+            return
+        self.notify(f"Opened {self.scratchpad.open_path}")
+
+    def action_delete_scratchpad(self) -> None:
+        """Ask before deleting the open conversation's scratchpad."""
+        pad = self.scratchpad
+        if not pad:
+            self.notify("This session left no scratchpad.")
+            return
+        detail = (
+            f"{pad.open_path}\n\n{pad.files} files · {pad.size_human}\n\n"
+            "It is deleted outright rather than moved to the trash."
+        )
+        self.push_screen(Confirm("Delete this scratchpad?", detail), self.delete_scratchpad_answered)
+
+    def delete_scratchpad_answered(self, confirmed: bool | None) -> None:
+        """Carry out a confirmed deletion of the scratchpad that was shown."""
+        pad = self.scratchpad
+        if not confirmed or not pad:
+            return
+        gone = leftovers.remove(pad)
+        self.notify(f"Deleted, freeing {pad.size_human}" if gone else "Nothing could be removed")
+        self.scratchpad = None
+        self.show_detail()
+
+    def action_leftovers(self) -> None:
+        """Open the sweep screen for what sessions with no conversation left behind."""
+        self.push_screen(Leftovers(self.cfg), self.leftovers_chosen)
+
+    def leftovers_chosen(self, kinds: list[str] | None) -> None:
+        """Delete the kinds that were ticked, off the UI thread."""
+        if not kinds:
+            return
+        self.notify("Deleting…")
+        self.sweep(kinds)
+
+    @work(thread=True)
+    def sweep(self, kinds: list[str]) -> None:
+        """Remove every orphaned leftover of the chosen kinds."""
+        count, freed = leftovers.remove_all(leftovers.orphans(kinds, self.cfg))
+        self.call_from_thread(
+            self.notify, f"Removed {count}, freeing {store.human_size(freed)}"
+        )
 
     def action_prompt(self) -> None:
         """Edit the summary prompt, then the review prompt."""
