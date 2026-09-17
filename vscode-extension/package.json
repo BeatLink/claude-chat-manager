@@ -1,0 +1,69 @@
+{
+    "name": "claude-chat-manager",
+    "displayName": "Claude Chat Manager",
+    "description": "Close a Claude Code conversation's tab and delete everything it left on disk.",
+    "version": "0.1.0",
+    "publisher": "beatlink",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Other"
+    ],
+    "main": "./extension.js",
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "contributes": {
+        "commands": [
+            {
+                "command": "claudeChatManager.deleteConversation",
+                "title": "Delete This Conversation",
+                "category": "Claude Chat Manager",
+                "icon": "$(trash)"
+            }
+        ],
+        "menus": {
+            "editor/title": [
+                {
+                    "command": "claudeChatManager.deleteConversation",
+                    "when": "activeWebviewPanelId == 'claudeVSCodePanel'",
+                    "group": "navigation@99"
+                }
+            ],
+            "webview/context": [
+                {
+                    "command": "claudeChatManager.deleteConversation",
+                    "when": "webviewId == 'claudeVSCodePanel'"
+                }
+            ],
+            "commandPalette": [
+                {
+                    "command": "claudeChatManager.deleteConversation",
+                    "when": "activeWebviewPanelId == 'claudeVSCodePanel'"
+                }
+            ]
+        },
+        "configuration": {
+            "title": "Claude Chat Manager",
+            "properties": {
+                "claudeChatManager.command": {
+                    "type": "string",
+                    "default": "ccm",
+                    "description": "The claude-chat-manager executable used to resolve and delete conversations."
+                },
+                "claudeChatManager.deleteLeftovers": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Also delete the conversation's scratchpad, session environment and file history."
+                },
+                "claudeChatManager.purge": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Delete the transcript outright instead of moving it to the trash."
+                }
+            }
+        }
+    }
+}

@@ -519,3 +519,159 @@ def test_the_sweep_summary_has_a_row_per_kind(leftover_workspace):
     assert list(rows) == list(leftovers.KINDS)
     assert rows["scratchpad"]["count"] == 1
     assert rows["session-env"]["count"] == 1
+
+
+def write_editor_state(root: Path, folder: str, payload: dict) -> Path:
+    """Write a workspace storage directory the way the editor lays one out."""
+    import sqlite3 as sql
+
+    directory = root / "workspaceStorage" / f"hash-{abs(hash(folder)) % 9999}"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "workspace.json").write_text(json.dumps({"folder": f"file://{folder}"}))
+    db = directory / "state.vscdb"
+    con = sql.connect(db)
+    con.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+    con.execute(
+        "INSERT OR REPLACE INTO ItemTable VALUES (?, ?)",
+        ("Anthropic.claude-code", json.dumps(payload)),
+    )
+    con.commit()
+    con.close()
+    return db
+
+
+@pytest.fixture
+def editor(tmp_path, monkeypatch):
+    """A fake editor state tree with one project holding two open conversation tabs."""
+    from claude_chat_manager import vscode as vscode_mod
+
+    monkeypatch.setattr(vscode_mod, "_WORKSPACE_CACHE", (0.0, {}))
+    root = tmp_path / "editor" / "User"
+    globalstorage = root / "globalStorage"
+    globalstorage.mkdir(parents=True)
+    write_editor_state(
+        root,
+        "/tmp/example",
+        {
+            "panelTabSessions": [
+                {"sessionId": "11111111-2222-3333-4444-555555555555", "title": "A short title"},
+                {"sessionId": "99999999-8888-7777-6666-555555555555", "title": "A long one that w…"},
+            ]
+        },
+    )
+    state = globalstorage / "state.vscdb"
+    import sqlite3 as sql
+
+    con = sql.connect(state)
+    con.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+    con.execute(
+        "INSERT INTO ItemTable VALUES (?, ?)",
+        ("Anthropic.claude-code", json.dumps({"hiddenSessionIds": ["deadbeef"]})),
+    )
+    con.commit()
+    con.close()
+    return config_mod.Config(vscode_state_db=str(state))
+
+
+def test_tab_labels_come_from_the_workspace_state(editor):
+    from claude_chat_manager import vscode as vscode_mod
+
+    labels = vscode_mod.tab_labels("/tmp/example", editor)
+    assert labels["11111111-2222-3333-4444-555555555555"] == "A short title"
+    assert labels["99999999-8888-7777-6666-555555555555"].endswith("…")
+
+
+def test_a_truncated_label_is_used_as_the_editor_wrote_it(editor):
+    from claude_chat_manager import vscode as vscode_mod
+
+    # The editor cuts a long title short, so the label must be read rather than derived from it.
+    label = vscode_mod.tab_label("99999999-8888-7777-6666-555555555555", "/tmp/example", editor)
+    assert label == "A long one that w…"
+
+
+def test_a_conversation_with_no_tab_has_no_label(editor):
+    from claude_chat_manager import vscode as vscode_mod
+
+    assert vscode_mod.tab_label("00000000-0000-0000-0000-000000000000", "/tmp/example", editor) == ""
+    assert vscode_mod.tab_labels("/tmp/nowhere", editor) == {}
+
+
+def test_archived_ids_still_read_from_global_state(editor):
+    from claude_chat_manager import vscode as vscode_mod
+
+    assert vscode_mod.archived_ids(editor) == {"deadbeef"}
+
+
+def test_bridges_skip_dead_editors_and_empty_tokens(tmp_path):
+    from claude_chat_manager import ide as ide_mod
+
+    locks = tmp_path / "ide"
+    locks.mkdir()
+    (locks / "4001.lock").write_text(
+        json.dumps({"pid": 1, "authToken": "t", "ideName": "X", "workspaceFolders": ["/tmp/example"]})
+    )
+    (locks / "4002.lock").write_text(
+        json.dumps({"pid": 999999, "authToken": "t", "workspaceFolders": ["/tmp/example"]})
+    )
+    (locks / "4003.lock").write_text(
+        json.dumps({"pid": 1, "authToken": "", "workspaceFolders": ["/tmp/example"]})
+    )
+    (locks / "notalock.txt").write_text("{}")
+    cfg = config_mod.Config(claude_dir=str(tmp_path))
+    found = ide_mod.bridges(cfg)
+    assert [b.port for b in found] == [4001]
+    assert found[0].covers("/tmp/example/deeper")
+    assert not found[0].covers("/tmp/elsewhere")
+
+
+def test_closing_a_tab_needs_a_running_editor(editor, tmp_path):
+    from claude_chat_manager import ide as ide_mod
+
+    cfg = config_mod.Config(vscode_state_db=editor.vscode_state_db, claude_dir=str(tmp_path))
+    with pytest.raises(ide_mod.BridgeError):
+        ide_mod.close_conversation_tab(
+            "11111111-2222-3333-4444-555555555555", "/tmp/example", cfg
+        )
+    assert "could not close its tab" in ide_mod.close_tab_quietly(
+        "11111111-2222-3333-4444-555555555555", "/tmp/example", cfg
+    )
+
+
+def test_closing_a_tab_that_is_not_open_is_not_an_error(editor, tmp_path):
+    from claude_chat_manager import ide as ide_mod
+
+    cfg = config_mod.Config(vscode_state_db=editor.vscode_state_db, claude_dir=str(tmp_path))
+    assert "no tab" in ide_mod.close_conversation_tab("nope", "/tmp/example", cfg)
+
+
+def test_deleting_everything_takes_the_leftovers_too(cfg, leftover_workspace):
+    live = "11111111-2222-3333-4444-555555555555"
+    assert leftovers.for_session(live, leftover_workspace)
+    convo = store.find(store.load_projects(cfg), live)
+    store.delete(convo, cfg, purge=True)
+    count, _freed = leftovers.remove_all(leftovers.for_session(live, leftover_workspace))
+    assert count == 3
+    assert not leftovers.for_session(live, leftover_workspace)
+
+
+def test_for_session_ignores_other_sessions(leftover_workspace):
+    gone = "99999999-8888-7777-6666-555555555555"
+    kinds = {item.kind for item in leftovers.for_session(gone, leftover_workspace)}
+    # Its dead session record belongs to it as much as its scratchpad does.
+    assert kinds == {"scratchpad", "session-env", "file-history", "session-record"}
+    assert not leftovers.for_session("00000000-0000-0000-0000-000000000000", leftover_workspace)
+
+
+def test_a_tab_resolves_back_to_its_conversation(editor):
+    from claude_chat_manager import vscode as vscode_mod
+
+    assert (
+        vscode_mod.session_for_tab("A long one that w…", "/tmp/example", editor)
+        == "99999999-8888-7777-6666-555555555555"
+    )
+    # Whitespace in a label is normalised, the way the editor's own matching does it.
+    assert (
+        vscode_mod.session_for_tab("A   short    title", "/tmp/example", editor)
+        == "11111111-2222-3333-4444-555555555555"
+    )
+    assert vscode_mod.session_for_tab("Claude Code", "/tmp/example", editor) == ""

@@ -12,7 +12,8 @@ the same data and share the same settings:
 | `claude-chat-manager` (or `ccm`) | Textual terminal interface |
 | `claude-chat-manager gtk` | GTK4 / libadwaita window |
 | `claude-chat-manager web` | local web interface at `http://127.0.0.1:8765` |
-| `ccm list`, `ccm summarize`, `ccm review`, `ccm delete`, `ccm trash`, `ccm prune`, `ccm sweep` | plain command line |
+| `ccm list`, `ccm summarize`, `ccm review`, `ccm delete`, `ccm trash`, `ccm prune`, `ccm sweep`, `ccm close-tab` | plain command line |
+| a button on the conversation's tab in VS Code | the editor extension below |
 | `ccm memory list\|show\|check\|delete\|health` | the same for memory files |
 
 ## Summarizing
@@ -100,12 +101,43 @@ ccm sweep --scratchpads --session-env        # remove those two kinds
 ccm sweep --all -y                           # remove every kind without asking
 ```
 
+## The editor
+
+A conversation you are looking at in VS Code is an editor tab, and the extension in
+`vscode-extension/` puts a **Delete This Conversation** button in that tab's title bar — also on the
+tab's right-click menu and in the command palette. Pressing it names what is about to go, closes the
+tab, and then runs `ccm delete --everything`, so the editor and this tool agree on what "delete"
+means rather than each having their own idea.
+
+Install it with Nix from the `vscode-extension` package:
+
+```nix
+programs.vscode.profiles.default.extensions = [
+    inputs.claude-chat-manager.packages.${system}.vscode-extension
+];
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `claudeChatManager.command` | `ccm` | the executable the button runs |
+| `claudeChatManager.deleteLeftovers` | `true` | take the scratchpad and the rest with it |
+| `claudeChatManager.purge` | `false` | delete the transcript outright rather than trashing it |
+
+A brand new conversation is labelled just "Claude Code" until it has a title, and that names no
+particular one, so the button asks you to send a message first rather than guessing.
+
+Outside the editor, the same tab can be closed from any frontend — `t` in the terminal, the **Close
+tab** button in the others, or `ccm close-tab <session>`. That works by connecting to the editor over
+the bridge Claude Code leaves in `~/.claude/ide`, so the editor has to be running and have the
+project open. Deleting a conversation closes its tab first unless you pass `--keep-tab`.
+
 ## Deleting
 
 Deleting moves the transcript to `~/.local/share/claude-chat-manager/trash/` rather than destroying it, so a
 mistake is recoverable. Set `trash_on_delete` to `false`, or pass `--purge` on the command line, to
-delete outright. `ccm prune` removes project directories that no longer hold any conversations. Scratchpads are never
-trashed — there is no undo for those.
+delete outright. `ccm prune` removes project directories that no longer hold any conversations. `ccm delete
+--everything` takes one conversation's scratchpad, session environment and file history with it.
+Scratchpads are never trashed — there is no undo for those.
 
 ## Installing
 

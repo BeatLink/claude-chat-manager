@@ -325,6 +325,7 @@ function drawDetail() {
             <button id="docheck">${review ? "Check again" : "Check outstanding items"}</button>
             <button id="dodelete" class="danger">Delete</button>
         </div>
+        <div id="tabstate"></div>
         <div id="scratchpad"></div>
         <div id="summary">${summary
             ? markdown(summary.text) + (summary.stale
@@ -344,7 +345,40 @@ function drawDetail() {
     $("dosummarize").onclick = () => summarize(convo, Boolean(summary));
     $("docheck").onclick = () => check(convo, Boolean(review));
     $("dodelete").onclick = () => askDelete(convo);
+    drawTabState(convo);
     drawScratchpad(convo);
+}
+
+/* Whether the editor still has this conversation open, which only it knows. */
+async function drawTabState(convo) {
+    const root = $("tabstate");
+    if (!root) return;
+    root.innerHTML = "";
+    let data;
+    try {
+        data = await api(`/api/tab/${convo.session_id}`);
+    } catch (error) {
+        return;
+    }
+    if (state.session !== convo.session_id || !data.label) return;
+    root.innerHTML = `<p class="empty">Open in the editor as “${escapeHtml(data.label)}”</p>
+        <div class="actions"><button id="tabclose">Close tab</button></div>`;
+    $("tabclose").onclick = async () => {
+        const button = $("tabclose");
+        button.disabled = true;
+        button.textContent = "Closing…";
+        try {
+            const reply = await api("/api/close-tab", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ session_id: convo.session_id }),
+            });
+            toast(reply.message);
+        } catch (error) {
+            toast(String(error.message || error));
+        }
+        drawTabState(convo);
+    };
 }
 
 /* The scratchpad is measured only for the conversation on screen, because walking every one is slow. */
@@ -465,7 +499,8 @@ function askDelete(convo) {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ session_id: convo.session_id }),
             });
-            toast(data.where === "deleted" ? "Deleted" : "Moved to the trash");
+            toast((data.closed ? data.closed + "; " : "")
+                + (data.where === "deleted" ? "deleted" : "moved to the trash"));
             state.session = null;
             await load(false);
         } catch (error) {

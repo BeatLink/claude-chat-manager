@@ -24,6 +24,7 @@ from textual.widgets import (
 )
 
 from . import config as config_mod
+from . import ide
 from . import leftovers
 from . import memories as memories_mod
 from . import store, summarize
@@ -181,6 +182,7 @@ class ChatManager(App):
         ("o", "scratchpad", "Scratchpad"),
         ("x", "delete_scratchpad", "Del scratchpad"),
         ("l", "leftovers", "Leftovers"),
+        ("t", "close_tab", "Close tab"),
         ("p", "prompt", "Prompt"),
         ("slash", "filter", "Filter"),
         ("r", "refresh", "Rescan"),
@@ -460,6 +462,9 @@ class ChatManager(App):
         pad = self.scratchpad
         if pad and pad.session_id == convo.session_id:
             lines.append(f"Scratchpad: {pad.files} files, {pad.size_human} — o opens it, x deletes it")
+        label = ide.tab_is_open(convo.session_id, convo.project_path, self.cfg)
+        if label:
+            lines.append(f"Open in the editor as {label!r} — t closes that tab")
         meta.update("\n".join(lines))
         self.measure_scratchpad(convo.session_id)
         if self.busy:
@@ -653,9 +658,12 @@ class ChatManager(App):
             else "It is deleted outright."
         )
         live = "\n\nThis conversation was written to moments ago — a session may still have it open."
+        label = ide.tab_is_open(convo.session_id, convo.project_path, self.cfg)
+        tab = f"\n\nIts editor tab {label!r} is closed first." if label else ""
         detail = (
             f"{convo.display_title}\n\n{convo.path}\n"
             f"{convo.messages} messages · {store.human_size(convo.size)}\n\n{where}"
+            + tab
             + (live if convo.live else "")
         )
         self.push_screen(Confirm("Delete this conversation?", detail), self.delete_answered)
@@ -665,6 +673,8 @@ class ChatManager(App):
         convo = self.opened()
         if not confirmed or not convo:
             return
+        if ide.tab_is_open(convo.session_id, convo.project_path, self.cfg):
+            self.notify(ide.close_tab_quietly(convo.session_id, convo.project_path, self.cfg))
         where = store.delete(convo, self.cfg)
         summarize.forget(convo.session_id)
         self.open_id = None
@@ -732,6 +742,19 @@ class ChatManager(App):
         gone = leftovers.remove(pad)
         self.notify(f"Deleted, freeing {pad.size_human}" if gone else "Nothing could be removed")
         self.scratchpad = None
+        self.show_detail()
+
+    def action_close_tab(self) -> None:
+        """Close the open conversation's tab in the editor, leaving the conversation alone."""
+        convo = self.opened() if self.mode == "conversations" else None
+        if not convo:
+            return
+        try:
+            message = ide.close_conversation_tab(convo.session_id, convo.project_path, self.cfg)
+        except ide.BridgeError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.notify(message)
         self.show_detail()
 
     def action_leftovers(self) -> None:

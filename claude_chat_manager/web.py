@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import config as config_mod
+from . import ide
 from . import leftovers
 from . import memories as memories_mod
 from . import render, store, summarize
@@ -177,6 +178,14 @@ class Handler(BaseHTTPRequestHandler):
                     "size_human": store.human_size(sum(item.size for item in items)),
                 }
             )
+        elif route.startswith("/api/tab/"):
+            convo = self.state.find(route.rsplit("/", 1)[-1])
+            label = (
+                ide.tab_is_open(convo.session_id, convo.project_path, self.state.cfg)
+                if convo
+                else ""
+            )
+            self.send_json({"label": label})
         elif route.startswith("/api/scratchpad/"):
             pad = leftovers.scratchpad_for(route.rsplit("/", 1)[-1], self.state.cfg)
             self.send_json(leftovers.leftover_dict(pad) if pad else {"path": ""})
@@ -291,10 +300,15 @@ class Handler(BaseHTTPRequestHandler):
             if not convo:
                 self.send_json({"error": "no such conversation"}, 404)
                 return
+            closed = ""
+            if ide.tab_is_open(convo.session_id, convo.project_path, self.state.cfg):
+                closed = ide.close_tab_quietly(
+                    convo.session_id, convo.project_path, self.state.cfg
+                )
             where = store.delete(convo, self.state.cfg, purge=bool(payload.get("purge")))
             summarize.forget(convo.session_id)
             self.state.reload()
-            self.send_json({"ok": True, "where": where})
+            self.send_json({"ok": True, "where": where, "closed": closed})
         elif route in ("/api/scratchpad-open", "/api/scratchpad-delete"):
             convo = self.state.find(payload.get("session_id", ""))
             pad = leftovers.scratchpad_for(convo.session_id, self.state.cfg) if convo else None
@@ -306,6 +320,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "path": pad.open_path})
                 return
             self.send_json({"ok": leftovers.remove(pad), "size_human": pad.size_human})
+        elif route == "/api/close-tab":
+            convo = self.state.find(payload.get("session_id", ""))
+            if not convo:
+                self.send_json({"error": "no such conversation"}, 404)
+                return
+            try:
+                message = ide.close_conversation_tab(
+                    convo.session_id, convo.project_path, self.state.cfg
+                )
+            except ide.BridgeError as exc:
+                self.send_json({"error": str(exc)}, 502)
+                return
+            self.send_json({"ok": True, "message": message})
         elif route == "/api/sweep":
             kinds = [k for k in (payload.get("kinds") or []) if k in leftovers.KINDS]
             if not kinds:

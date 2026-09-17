@@ -9,9 +9,11 @@ from pathlib import Path
 from dataclasses import asdict
 
 from . import config as config_mod
+from . import ide
 from . import leftovers
 from . import memories as memories_mod
 from . import store, summarize
+from . import vscode
 
 
 def _fail(message: str) -> int:
@@ -141,14 +143,22 @@ def cmd_delete(args, cfg) -> int:
     convo = store.find(projects, args.session)
     if not convo:
         return _fail(f"no conversation matching {args.session!r}")
+    label = ide.tab_is_open(convo.session_id, convo.project_path, cfg)
     print(f"{convo.display_title}\n  {convo.path}\n  {convo.messages} messages, {store.human_size(convo.size)}")
+    if label and not args.keep_tab:
+        print(f"  its tab {label!r} is open in the editor and will be closed first")
     if not args.yes:
         if input("delete this conversation? [y/N] ").strip().lower() not in ("y", "yes"):
             print("left alone")
             return 0
+    if label and not args.keep_tab:
+        print(ide.close_tab_quietly(convo.session_id, convo.project_path, cfg))
     destination = store.delete(convo, cfg, purge=args.purge)
     summarize.forget(convo.session_id)
     print("purged" if destination == "deleted" else f"moved to {destination}")
+    if args.everything:
+        count, freed = leftovers.remove_all(leftovers.for_session(convo.session_id, cfg))
+        print(f"removed {count} leftovers, freeing {store.human_size(freed)}")
     return 0
 
 
@@ -165,6 +175,47 @@ def cmd_prune(args, cfg) -> int:
             print("left alone")
             return 0
     print(f"removed {len(store.prune_empty(cfg))}")
+    return 0
+
+
+def cmd_resolve_tab(args, cfg) -> int:
+    """Print the session id behind an editor tab, which is what the editor button needs."""
+    session_id = vscode.session_for_tab(args.label, args.project, cfg)
+    if not session_id:
+        return _fail(f"no conversation is open in a tab named {args.label!r}")
+    if not args.json:
+        print(session_id)
+        return 0
+    convo = store.find(store.load_projects(cfg), session_id)
+    print(
+        json.dumps(
+            {
+                "session_id": session_id,
+                "title": convo.display_title if convo else args.label,
+                "messages": convo.messages if convo else 0,
+                "size_human": store.human_size(convo.size) if convo else "",
+                "path": convo.path if convo else "",
+                "leftovers": [
+                    {"kind": item.kind, "size_human": item.size_human, "path": item.path}
+                    for item in leftovers.for_session(session_id, cfg)
+                ],
+            }
+        )
+    )
+    return 0
+
+
+def cmd_close_tab(args, cfg) -> int:
+    """Close a conversation's tab in the editor that has its project open."""
+    projects = store.load_projects(cfg)
+    convo = store.find(projects, args.session)
+    if not convo:
+        return _fail(f"no conversation matching {args.session!r}")
+    print(convo.display_title)
+    try:
+        print(f"  {ide.close_conversation_tab(convo.session_id, convo.project_path, cfg)}")
+    except ide.BridgeError as exc:
+        return _fail(str(exc))
     return 0
 
 
@@ -396,11 +447,27 @@ def build_parser() -> argparse.ArgumentParser:
     delete.add_argument("session", help="session id or unique prefix")
     delete.add_argument("-y", "--yes", action="store_true", help="do not ask first")
     delete.add_argument("--purge", action="store_true", help="delete outright instead of trashing")
+    delete.add_argument("--keep-tab", action="store_true", help="leave its editor tab open")
+    delete.add_argument(
+        "--everything",
+        action="store_true",
+        help="also remove its scratchpad, environment and file history",
+    )
+
+    resolving = subs.add_parser("resolve-tab", help="the conversation behind an editor tab")
+    resolving.add_argument("label", help="the tab's label, exactly as the editor shows it")
+    resolving.add_argument("-p", "--project", required=True, help="the project the tab belongs to")
+    resolving.add_argument("--json", action="store_true", help="print what the tab holds too")
+    resolving.set_defaults(func=cmd_resolve_tab)
     delete.set_defaults(func=cmd_delete)
 
     prune = subs.add_parser("prune", help="remove project directories with no conversations left")
     prune.add_argument("-y", "--yes", action="store_true", help="do not ask first")
     prune.set_defaults(func=cmd_prune)
+
+    closing = subs.add_parser("close-tab", help="close a conversation's tab in the editor")
+    closing.add_argument("session", help="session id or unique prefix")
+    closing.set_defaults(func=cmd_close_tab)
 
     scratchpad = subs.add_parser("scratchpad", help="show, open or delete a conversation's scratchpad")
     scratchpad.add_argument("session", help="session id or unique prefix")

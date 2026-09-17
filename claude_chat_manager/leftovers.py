@@ -247,6 +247,14 @@ def collect(
     return out
 
 
+def for_session(
+    session_id: str, cfg: config_mod.Config | None = None, measured: bool = True
+) -> list[Leftover]:
+    """Everything one session left behind, whether or not its conversation still exists."""
+    cfg = cfg or config_mod.load()
+    return [item for item in collect(None, cfg, measured) if item.session_id == session_id]
+
+
 def scratchpad_for(session_id: str, cfg: config_mod.Config | None = None) -> Leftover | None:
     """The scratchpad one conversation's session wrote, if it left one."""
     for root in scratchpad_roots(cfg):

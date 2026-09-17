@@ -16,6 +16,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
 
 from . import config as config_mod  # noqa: E402
+from . import ide  # noqa: E402
 from . import leftovers  # noqa: E402
 from . import memories as memories_mod  # noqa: E402
 from . import store, summarize  # noqa: E402
@@ -173,6 +174,16 @@ class Window(Adw.ApplicationWindow):
         for widget in (self.scratchpad_label, self.scratchpad_open, self.scratchpad_delete):
             self.scratchpad_box.append(widget)
 
+        self.tab_label_text = Gtk.Label(
+            xalign=0, hexpand=True, selectable=True, ellipsize=Pango.EllipsizeMode.MIDDLE
+        )
+        self.tab_label_text.add_css_class("dim-label")
+        self.tab_close = Gtk.Button(label="Close tab", valign=Gtk.Align.CENTER)
+        self.tab_close.connect("clicked", lambda *_: self.close_editor_tab())
+        self.tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.tab_box.append(self.tab_label_text)
+        self.tab_box.append(self.tab_close)
+
         self.verdict_label = Gtk.Label(xalign=0, wrap=True, use_markup=True)
         self.review_label = Gtk.Label(
             xalign=0, yalign=0, wrap=True, selectable=True, use_markup=True
@@ -191,6 +202,7 @@ class Window(Adw.ApplicationWindow):
         for widget in (
             self.title_label,
             self.meta_label,
+            self.tab_box,
             self.scratchpad_box,
             self.summary_label,
             Gtk.Separator(),
@@ -396,12 +408,14 @@ class Window(Adw.ApplicationWindow):
         convo = self.opened()
         if convo is None:
             self.scratchpad_box.set_visible(False)
+            self.tab_box.set_visible(False)
             self.title_label.set_text("")
             self.meta_label.set_text("")
             self.summary_label.set_markup("<i>No conversation selected.</i>")
             self.verdict_label.set_markup("")
             self.review_label.set_markup("")
             return
+        self.show_tab(convo)
         self.show_scratchpad(convo)
         tokens = convo.input_tokens + convo.output_tokens
         bits = [
@@ -449,6 +463,7 @@ class Window(Adw.ApplicationWindow):
     def show_memory_detail(self) -> None:
         """Update the right hand pane for the open memory."""
         self.scratchpad_box.set_visible(False)
+        self.tab_box.set_visible(False)
         memory = self.opened_memory()
         if memory is None:
             self.title_label.set_text("")
@@ -581,6 +596,26 @@ class Window(Adw.ApplicationWindow):
         self.toast(message)
         self.fill_middle()
         return False
+
+    def show_tab(self, convo) -> None:
+        """Say whether the editor still has this conversation open, and offer to close it."""
+        label = ide.tab_is_open(convo.session_id, convo.project_path, self.cfg)
+        self.tab_box.set_visible(bool(label))
+        if label:
+            self.tab_label_text.set_text(f"Open in the editor as “{label}”")
+
+    def close_editor_tab(self) -> None:
+        """Close the open conversation's tab, leaving the conversation itself alone."""
+        convo = self.opened()
+        if not convo:
+            return
+        try:
+            message = ide.close_conversation_tab(convo.session_id, convo.project_path, self.cfg)
+        except ide.BridgeError as exc:
+            self.toast(str(exc))
+            return
+        self.toast(message)
+        self.show_tab(convo)
 
     def show_scratchpad(self, convo) -> None:
         """Measure the open conversation's scratchpad off the UI thread and show what it holds."""
@@ -757,6 +792,9 @@ class Window(Adw.ApplicationWindow):
             else "It is deleted outright."
         )
         body = f"{convo.display_title}\n\n{convo.path}\n\n{where}"
+        label = ide.tab_is_open(convo.session_id, convo.project_path, self.cfg)
+        if label:
+            body += f"\n\nIts editor tab “{label}” is closed first."
         if convo.live:
             body += "\n\nThis conversation was written to moments ago — a session may still have it open."
         dialog = Adw.AlertDialog(heading="Delete this conversation?", body=body)
@@ -771,6 +809,8 @@ class Window(Adw.ApplicationWindow):
         """Carry out a confirmed deletion of the conversation that was open."""
         if response != "delete":
             return
+        if ide.tab_is_open(convo.session_id, convo.project_path, self.cfg):
+            self.toast(ide.close_tab_quietly(convo.session_id, convo.project_path, self.cfg))
         where = store.delete(convo, self.cfg)
         summarize.forget(convo.session_id)
         self.open_id = None
