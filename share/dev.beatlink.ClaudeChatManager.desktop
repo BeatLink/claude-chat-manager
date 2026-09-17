@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Chat Manager
+Comment=Browse, summarize and delete Claude Code conversations
+Exec=claude-chat-manager-gtk
+Icon=text-x-generic
+Terminal=false
+Categories=Utility;Development;
+StartupNotify=true

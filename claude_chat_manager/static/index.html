@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Chat Manager</title>
+<style>
+:root {
+    color-scheme: light dark;
+    --bg: #f6f6f4; --panel: #fff; --line: #e2e1dd; --text: #1d1c1a; --muted: #6d6a64;
+    --accent: #b05730; --accent-soft: #f3e3da; --danger: #a8332a; --shadow: 0 1px 2px rgba(0,0,0,.06);
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #17161a; --panel: #1f1e23; --line: #32303a; --text: #ecebe8; --muted: #9b978f;
+        --accent: #e08a5f; --accent-soft: #3a2a22; --danger: #e0655a; --shadow: none;
+    }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+       background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+header { display: flex; gap: 12px; align-items: center; padding: 10px 16px;
+         background: var(--panel); border-bottom: 1px solid var(--line); }
+header h1 { font-size: 15px; margin: 0 8px 0 0; letter-spacing: .02em; }
+#search { flex: 1; max-width: 340px; padding: 7px 10px; border: 1px solid var(--line);
+          border-radius: 7px; background: var(--bg); color: inherit; font: inherit; }
+#stats { margin-left: auto; color: var(--muted); font-size: 13px; }
+button { font: inherit; padding: 7px 12px; border-radius: 7px; border: 1px solid var(--line);
+         background: var(--panel); color: inherit; cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--danger); }
+main { flex: 1; display: grid; grid-template-columns: 250px minmax(280px, 1fr) 1.3fr; min-height: 0; }
+main > section { overflow-y: auto; border-right: 1px solid var(--line); }
+main > section:last-child { border-right: none; }
+.row { padding: 9px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.row:hover { background: var(--panel); }
+.row.active { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+.row .name { display: flex; justify-content: space-between; gap: 8px; }
+.row .title { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .sub { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap; }
+.count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.mark { color: var(--accent); }
+#detail { padding: 22px 26px; }
+#detail h2 { margin: 0 0 6px; font-size: 19px; }
+#meta { color: var(--muted); font-size: 12.5px; margin-bottom: 18px; word-break: break-all; }
+#actions { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+#summary { max-width: 62ch; }
+#summary h3 { font-size: 14px; margin: 18px 0 6px; }
+#summary ul { padding-left: 20px; margin: 6px 0; }
+#summary li { margin: 4px 0; }
+#summary code { background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+                padding: 0 4px; font-size: 12.5px; }
+.empty { color: var(--muted); font-style: italic; }
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: inherit;
+         padding: 0; max-width: 720px; width: 90%; box-shadow: 0 10px 40px rgba(0,0,0,.25); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+.dialog-body { padding: 20px 22px; }
+.dialog-body h3 { margin: 0 0 10px; }
+.dialog-foot { display: flex; gap: 8px; justify-content: flex-end; padding: 14px 22px;
+               border-top: 1px solid var(--line); }
+textarea { width: 100%; min-height: 260px; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+           padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg);
+           color: inherit; resize: vertical; }
+#toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--panel);
+         border: 1px solid var(--line); border-radius: 8px; padding: 10px 16px; box-shadow: var(--shadow);
+         opacity: 0; transition: opacity .2s; pointer-events: none; }
+#toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+    <h1>Claude Chat Manager</h1>
+    <input id="search" type="search" placeholder="Filter conversations">
+    <button id="rescan">Rescan</button>
+    <button id="editprompt">Prompt</button>
+    <span id="stats"></span>
+</header>
+
+<main>
+    <section id="projects"></section>
+    <section id="conversations"></section>
+    <section id="detail">
+        <p class="empty">Select a conversation.</p>
+    </section>
+</main>
+
+<dialog id="promptdialog">
+    <div class="dialog-body">
+        <h3>Summarization prompt</h3>
+        <p class="empty">Sent to <code>claude -p</code> with the rendered transcript on stdin.</p>
+        <textarea id="prompttext"></textarea>
+    </div>
+    <div class="dialog-foot">
+        <button id="promptdefault">Restore default</button>
+        <button id="promptcancel">Cancel</button>
+        <button id="promptsave" class="primary">Save</button>
+    </div>
+</dialog>
+
+<dialog id="deletedialog">
+    <div class="dialog-body">
+        <h3>Delete this conversation?</h3>
+        <p id="deletedetail"></p>
+    </div>
+    <div class="dialog-foot">
+        <button id="deletecancel">Cancel</button>
+        <button id="deleteok" class="primary">Delete</button>
+    </div>
+</dialog>
+
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
