@@ -50,10 +50,13 @@
                 vscode-extension =
                     pkgs.runCommand "vscode-claude-chat-manager"
                         {
+                            # The editor module reads all four off the package to name the directory it installs into.
+                            version = "0.1.0";
                             passthru = {
                                 vscodeExtUniqueId = "beatlink.claude-chat-manager";
                                 vscodeExtPublisher = "beatlink";
                                 vscodeExtName = "claude-chat-manager";
+                                vscodeExtVersion = "0.1.0";
                             };
                         }
                         ''
