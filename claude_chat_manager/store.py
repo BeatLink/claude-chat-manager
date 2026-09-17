@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config as config_mod
+from . import vscode
 
 INDEX_VERSION = 3
 
@@ -44,6 +45,7 @@ class Conversation:
     tool_calls: int = 0
     sidechain_messages: int = 0
     corrupt_lines: int = 0
+    archived: bool = False
     models: list[str] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
@@ -58,6 +60,13 @@ class Conversation:
     def modified(self) -> datetime:
         """Last write time as a local datetime."""
         return datetime.fromtimestamp(self.mtime)
+
+    @property
+    def state(self) -> str:
+        """Whether a session is writing to this conversation, the editor has archived it, or neither."""
+        if self.live:
+            return "live"
+        return "archived" if self.archived else ""
 
     @property
     def live(self) -> bool:
@@ -227,6 +236,7 @@ def load_projects(cfg: config_mod.Config | None = None, refresh: bool = False) -
     cfg = cfg or config_mod.load()
     root = cfg.projects_path
     cached = {} if refresh else _load_index()
+    archived = vscode.archived_ids(cfg)
     fresh: dict = {}
     projects: list[Project] = []
     if not root.is_dir():
@@ -252,6 +262,8 @@ def load_projects(cfg: config_mod.Config | None = None, refresh: bool = False) -
                 "size": stat.st_size,
                 "conversation": asdict(convo),
             }
+            # Archiving happens in the editor and leaves the transcript untouched, so it is read fresh rather than cached.
+            convo.archived = convo.session_id in archived
             project.conversations.append(convo)
         if not project.conversations:
             continue
@@ -271,6 +283,8 @@ def conversation_dict(convo: Conversation) -> dict:
     data = asdict(convo)
     data.update(
         messages=convo.messages,
+        state=convo.state,
+        live=convo.live,
         display_title=convo.display_title,
         age=human_age(convo.mtime),
         size_human=human_size(convo.size),
@@ -439,6 +453,27 @@ def stats(projects: list[Project]) -> dict:
         "corrupt": sum(1 for c in conversations if c.corrupt_lines),
         "newest": max((c.mtime for c in conversations), default=0.0),
     }
+
+
+STATE_MARKS = {"live": "●", "archived": "▣"}
+
+STATE_WORDS = {
+    "live": "a session is writing to this conversation now",
+    "archived": "archived out of the editor's session list",
+}
+
+LEGEND = "✓ summarized  ✔!? checked  ● live  ▣ archived"
+
+
+def marks(convo: Conversation, summary=None, review=None) -> str:
+    """The three status glyphs for one conversation: summary, check, and what the editor is doing with it."""
+    first = " "
+    if summary:
+        first = "✓" if not summary.stale(convo) else "~"
+    second = " "
+    if review:
+        second = {"safe-to-delete": "✔", "keep": "!"}.get(review.verdict, "?")
+    return f"{first}{second}{STATE_MARKS.get(convo.state, ' ')}"
 
 
 def human_size(count: int) -> str:

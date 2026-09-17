@@ -13,6 +13,7 @@ the same data and share the same settings:
 | `claude-chat-manager gtk` | GTK4 / libadwaita window |
 | `claude-chat-manager web` | local web interface at `http://127.0.0.1:8765` |
 | `ccm list`, `ccm summarize`, `ccm review`, `ccm delete`, `ccm trash`, `ccm prune` | plain command line |
+| `ccm memory list\|show\|check\|delete\|health` | the same for memory files |
 
 ## Summarizing
 
@@ -27,6 +28,26 @@ conversation was about, what was done, and what is still outstanding.
 
 Summaries are cached in `~/.local/share/claude-chat-manager/summaries/`. A cached summary is marked `✓` in the
 list, or `~` when the conversation has grown since it was written.
+
+## Memories
+
+Claude also leaves memory files behind: the global workspace at `~/.claude/memory/` and one directory
+per project under `~/.claude/projects/<project>/memory/`. Each frontend shows them in the same three
+panes as conversations — the sidebar lists the scopes under a **Memories** heading — with the same
+two actions.
+
+**Is it still true?** takes one memory and checks it against the project it describes: it reads the
+files and paths the memory names, greps for the options and identifiers it mentions, and reports each
+claim as **still true**, **no longer true** or **cannot tell**, with a verdict of *still true*, *out
+of date* or *unclear*. Preferences and reasons, which no file can confirm, come back as "cannot
+tell" rather than as a guess.
+
+**Delete** removes the memory file *and* its pointer line from that scope's `MEMORY.md`, so nothing
+is left pointing at a file that is gone.
+
+`ccm memory health` reports the three ways a memory workspace rots: memories with no pointer in
+`MEMORY.md` (which sessions therefore never load), pointers whose file has been deleted, and
+`[[links]]` that resolve to no memory in any scope.
 
 ## Checking the outstanding items
 
@@ -81,6 +102,9 @@ standard library.
 | `review_system_prompt` | see above | keeps the check read-only and machine-readable |
 | `review_tools` | `Read`, `Grep`, `Glob`, `git` | the tools the check is allowed to use |
 | `review_timeout` | `900` | seconds before a check is given up on |
+| `memory_prompt` | see above | the prompt for checking whether a memory is still true |
+| `global_memory_dir` | `~/.claude/memory` | the memory workspace that is not tied to a project |
+| `vscode_state_db` | *(auto)* | where to read the editor's archived-session list from |
 | `include_thinking` | `false` | include thinking blocks in the rendered transcript |
 | `include_tool_calls` | `true` | include a one-line note per tool call |
 | `include_tool_results` | `false` | include truncated tool output |

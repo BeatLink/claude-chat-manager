@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from claude_chat_manager import config as config_mod
+from claude_chat_manager import memories
 from claude_chat_manager import render, store, summarize
 
 
@@ -294,3 +295,144 @@ def test_live_conversations_are_flagged(cfg):
     assert convo.live
     convo.mtime -= 600
     assert not convo.live
+
+
+def _write_state_db(path: Path, hidden: list[str]) -> Path:
+    """Write a state database shaped like the editor's own."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+    db.execute(
+        "INSERT INTO ItemTable VALUES (?, ?)",
+        ("Anthropic.claude-code", json.dumps({"hiddenSessionIds": hidden})),
+    )
+    db.commit()
+    db.close()
+    return path
+
+
+def test_archived_ids_come_from_the_editor_state(cfg, tmp_path):
+    """Archived conversations are read out of the editor's own state database."""
+    from claude_chat_manager import vscode
+
+    session = "11111111-2222-3333-4444-555555555555"
+    cfg.vscode_state_db = str(_write_state_db(tmp_path / "state.vscdb", [session]))
+    assert vscode.archived_ids(cfg) == {session}
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    assert convo.archived
+
+
+def test_missing_state_db_is_not_an_error(cfg, tmp_path):
+    """A missing or unreadable editor database simply means nothing is archived."""
+    from claude_chat_manager import vscode
+
+    cfg.vscode_state_db = str(tmp_path / "nowhere.vscdb")
+    assert vscode.archived_ids(cfg) == set()
+
+
+def test_marks_show_state_last(cfg, tmp_path):
+    """The glyphs read summary, check, then what the editor is doing with the conversation."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    assert store.marks(convo)[2] == "●"
+    convo.mtime -= 600
+    assert store.marks(convo)[2] == " "
+    convo.archived = True
+    assert store.marks(convo) == "  ▣"
+    assert convo.state == "archived"
+
+
+def write_memory(directory: Path, name: str, body: str = "A fact about [[something-else]].",
+                 kind: str = "project", indexed: bool = True) -> Path:
+    """Write one memory file, and its index line when it is meant to be listed."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{name}.md"
+    path.write_text(
+        f"---\nname: {name}\ndescription: what {name} is about\nmetadata:\n  type: {kind}\n---\n\n{body}\n"
+    )
+    index = directory / "MEMORY.md"
+    lines = index.read_text().splitlines() if index.exists() else []
+    if indexed:
+        lines.append(f"- [{name}]({name}.md) — a hook")
+    index.write_text("\n".join(lines) + "\n")
+    return path
+
+
+@pytest.fixture
+def memory_workspace(workspace, tmp_path, monkeypatch):
+    """A global memory workspace and one project scope, both with a MEMORY.md."""
+    from claude_chat_manager import config as config_module
+
+    everywhere = tmp_path / "global-memory"
+    write_memory(everywhere, "something-else", kind="feedback")
+    write_memory(workspace / "-tmp-example" / "memory", "a-project-fact")
+    cfg = config_module.Config(
+        projects_dir=str(workspace), global_memory_dir=str(everywhere)
+    )
+    return cfg
+
+
+def test_memories_are_grouped_by_scope(memory_workspace):
+    """The global workspace and each project's memory directory are separate scopes."""
+    scopes = memories.load_scopes(memory_workspace)
+    assert [s.slug for s in scopes] == ["global", "-tmp-example"]
+    assert scopes[0].memories[0].kind == "feedback"
+    assert scopes[1].memories[0].description == "what a-project-fact is about"
+    assert scopes[1].memories[0].project_path == "/tmp/example"
+
+
+def test_links_resolve_across_scopes(memory_workspace):
+    """A project memory may link to a global one without being called broken."""
+    scopes = memories.load_scopes(memory_workspace)
+    project = next(s for s in scopes if s.slug == "-tmp-example")
+    assert project.dead_links() != {}
+    assert project.dead_links(memories.all_names(scopes)) == {}
+
+
+def test_unindexed_memories_are_reported(memory_workspace):
+    """A memory with no pointer in MEMORY.md is flagged, because sessions never load it."""
+    scope_dir = Path(memory_workspace.global_memory_dir)
+    write_memory(scope_dir, "never-listed", indexed=False)
+    scope = memories.load_scopes(memory_workspace)[0]
+    assert [m.name for m in scope.unindexed] == ["never-listed"]
+
+
+def test_orphan_index_lines_are_reported(memory_workspace):
+    """A pointer whose file is gone is reported rather than silently ignored."""
+    index = Path(memory_workspace.global_memory_dir) / "MEMORY.md"
+    index.write_text(index.read_text() + "- [ghost](ghost.md) — not there\n")
+    scope = memories.load_scopes(memory_workspace)[0]
+    assert scope.orphan_index_lines and "ghost.md" in scope.orphan_index_lines[0]
+
+
+def test_deleting_a_memory_takes_its_index_line(memory_workspace):
+    """Deleting removes the file and the MEMORY.md line that pointed at it."""
+    scopes = memories.load_scopes(memory_workspace)
+    memory = memories.find(scopes, "something-else")
+    index = Path(memory.scope_path) / "MEMORY.md"
+    assert "something-else.md" in index.read_text()
+    where = memories.delete(memory, memory_workspace)
+    assert not Path(memory.path).exists()
+    assert Path(where).exists()
+    assert "something-else.md" not in index.read_text()
+
+
+def test_mentioned_dirs_come_from_the_body(memory_workspace, tmp_path):
+    """A check looks in the project and in any directory the memory names."""
+    named = tmp_path / "somewhere"
+    named.mkdir()
+    write_memory(
+        Path(memory_workspace.global_memory_dir),
+        "names-a-path",
+        body=f"The file at {named}/thing.conf holds it.",
+    )
+    memory = memories.find(memories.load_scopes(memory_workspace), "names-a-path")
+    assert str(named) in memories.mentioned_dirs(memory)
+
+
+def test_memory_verdicts_read_as_words():
+    """A memory check reports its verdict in the same words the views show."""
+    check = summarize.Review(session_id="x", text="{}", verdict="stale")
+    assert check.label == "out of date"
+    assert summarize.Review(session_id="x", text="{}", verdict="current").label == "still true"

@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import config as config_mod
+from . import memories as memories_mod
 from . import render, store, summarize
 
 STATIC = Path(__file__).parent / "static"
@@ -24,12 +25,24 @@ class State:
         self.cfg = cfg
         self.lock = threading.Lock()
         self.projects: list[store.Project] = []
+        self.scopes: list[memories_mod.Scope] = []
 
     def reload(self, refresh: bool = False) -> list[store.Project]:
-        """Rescan the transcripts."""
+        """Rescan the transcripts and the memories."""
         with self.lock:
             self.projects = store.load_projects(self.cfg, refresh=refresh)
+            self.scopes = memories_mod.load_scopes(self.cfg)
             return self.projects
+
+    def memory_scopes(self) -> list[memories_mod.Scope]:
+        """The memory scopes, scanned once."""
+        if not getattr(self, "scopes", None):
+            self.scopes = memories_mod.load_scopes(self.cfg)
+        return self.scopes
+
+    def find_memory(self, name: str):
+        """Look a memory up by name."""
+        return memories_mod.find(self.memory_scopes(), name)
 
     def ensure(self) -> list[store.Project]:
         """Scan once, then reuse the result."""
@@ -126,6 +139,25 @@ class Handler(BaseHTTPRequestHandler):
                     "trash_dir": str(store.trash_dir(self.state.cfg)),
                 }
             )
+        elif route == "/api/memories":
+            scopes = self.state.memory_scopes()
+            self.send_json(
+                {
+                    "scopes": [memories_mod.scope_dict(s) for s in scopes],
+                    "stats": memories_mod.stats(scopes),
+                    "checks": {
+                        m.name: {
+                            "lines": c.lines,
+                            "verdict": c.verdict,
+                            "label": c.label,
+                            "note": c.note,
+                        }
+                        for s in scopes
+                        for m in s.memories
+                        if (c := summarize.load_memory_check(m))
+                    },
+                }
+            )
         elif route == "/api/trash":
             self.send_json(
                 {
@@ -200,6 +232,47 @@ class Handler(BaseHTTPRequestHandler):
                     "cached": False,
                 }
             )
+        elif route == "/api/memory-check":
+            memory = self.state.find_memory(payload.get("name", ""))
+            if not memory:
+                self.send_json({"error": "no such memory"}, 404)
+                return
+            cached = summarize.load_memory_check(memory)
+            if cached and not payload.get("force"):
+                self.send_json(
+                    {
+                        "lines": cached.lines,
+                        "verdict": cached.verdict,
+                        "label": cached.label,
+                        "note": cached.note,
+                        "cached": True,
+                    }
+                )
+                return
+            try:
+                result = summarize.check_memory(memory, self.state.cfg)
+            except summarize.SummaryError as exc:
+                self.send_json({"error": str(exc)}, 500)
+                return
+            self.send_json(
+                {
+                    "lines": result.lines,
+                    "verdict": result.verdict,
+                    "label": result.label,
+                    "note": result.note,
+                    "seconds": result.seconds,
+                    "cached": False,
+                }
+            )
+        elif route == "/api/memory-delete":
+            memory = self.state.find_memory(payload.get("name", ""))
+            if not memory:
+                self.send_json({"error": "no such memory"}, 404)
+                return
+            where = memories_mod.delete(memory, self.state.cfg, purge=bool(payload.get("purge")))
+            summarize.forget_memory_check(memory)
+            self.state.reload()
+            self.send_json({"ok": True, "where": where})
         elif route == "/api/delete":
             convo = self.state.find(payload.get("session_id", ""))
             if not convo:

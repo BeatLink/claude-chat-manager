@@ -23,10 +23,8 @@ from textual.widgets import (
 )
 
 from . import config as config_mod
+from . import memories as memories_mod
 from . import store, summarize
-
-VERDICT_MARKS = {"safe-to-delete": "✔", "keep": "!", "unclear": "?"}
-
 
 class Confirm(ModalScreen[bool]):
     """Yes or no dialog used before a conversation is deleted."""
@@ -104,6 +102,7 @@ class ChatManager(App):
     #filter.visible { display: block; }
     .pane-title { background: $panel; color: $text; padding: 0 1; text-style: bold; }
     #meta { color: $text-muted; padding: 0 1; }
+    #legend { color: $text-muted; padding: 0 1; }
     #body { height: 1fr; }
     MarkdownUnorderedListItem { margin-bottom: 1; }
     MarkdownOrderedListItem { margin-bottom: 1; }
@@ -135,8 +134,13 @@ class ChatManager(App):
         super().__init__()
         self.cfg = cfg
         self.projects: list[store.Project] = []
+        self.scopes: list[memories_mod.Scope] = []
+        self.sidebar: list[tuple[str, int]] = []
         self.shown: list[store.Conversation] = []
+        self.shown_memories: list[memories_mod.Memory] = []
         self.open_id: str | None = None
+        self.open_memory: str | None = None
+        self.mode = "conversations"
         self.filter_text = ""
         self.busy = False
 
@@ -144,14 +148,15 @@ class ChatManager(App):
         yield Header()
         with Horizontal(id="panes"):
             with Vertical(id="sidebar"):
-                yield Static("Projects", classes="pane-title")
+                yield Static("Browse", classes="pane-title")
                 yield ListView(id="projects")
             with Vertical(id="middle"):
-                yield Static("Conversations", classes="pane-title")
+                yield Static("Conversations", id="middle-title", classes="pane-title")
+                yield Static(store.LEGEND, id="legend")
                 yield Input(placeholder="filter…", id="filter")
                 yield DataTable(id="conversations", cursor_type="row", zebra_stripes=True)
             with Vertical(id="detail"):
-                yield Static("Open conversation", classes="pane-title")
+                yield Static("Open conversation", id="detail-title", classes="pane-title")
                 yield Static("", id="meta")
                 yield Markdown("", id="body")
         yield Footer()
@@ -164,33 +169,85 @@ class ChatManager(App):
     # Loading ------------------------------------------------------------------------------------
 
     def load(self, refresh: bool = False) -> None:
-        """Scan the transcripts and fill the project list."""
+        """Scan the transcripts and the memories, and fill the sidebar with both."""
         self.projects = store.load_projects(self.cfg, refresh=refresh)
+        self.scopes = memories_mod.load_scopes(self.cfg)
         listing = self.query_one("#projects", ListView)
+        keep = listing.index or 0
         listing.clear()
+        self.sidebar = []
         totals = store.stats(self.projects)
-        listing.append(ListItem(Label(f"All projects  ({totals['conversations']})")))
-        for project in self.projects:
+
+        listing.append(ListItem(Label("[b]CONVERSATIONS[/b]")))
+        self.sidebar.append(("heading", 0))
+        listing.append(ListItem(Label(f"  All projects  ({totals['conversations']})")))
+        self.sidebar.append(("conversations", -1))
+        for index, project in enumerate(self.projects):
             mark = "" if project.exists else " ×"
             listing.append(
-                ListItem(Label(f"{project.name}{mark}  ({len(project.conversations)})"))
+                ListItem(Label(f"  {project.name}{mark}  ({len(project.conversations)})"))
             )
-        listing.index = 0
-        self.show_conversations()
+            self.sidebar.append(("conversations", index))
+
+        memory_totals = memories_mod.stats(self.scopes)
+        listing.append(ListItem(Label("[b]MEMORIES[/b]")))
+        self.sidebar.append(("heading", 0))
+        for index, scope in enumerate(self.scopes):
+            listing.append(ListItem(Label(f"  {scope.name}  ({len(scope.memories)})")))
+            self.sidebar.append(("memories", index))
+
+        listing.index = min(keep, len(self.sidebar) - 1) if keep else 1
+        self.show_middle()
         self.sub_title = (
-            f"{totals['conversations']} conversations · {totals['projects']} projects · "
+            f"{totals['conversations']} conversations · {memory_totals['memories']} memories · "
             f"{store.human_size(totals['bytes'])}"
         )
 
-    def current_project(self) -> store.Project | None:
-        """The project the sidebar is pointing at, or None for the combined view."""
+    def sidebar_choice(self) -> tuple[str, int]:
+        """What the sidebar is pointing at: a kind, and which project or scope."""
         index = self.query_one("#projects", ListView).index or 0
-        if index == 0:
+        if 0 <= index < len(self.sidebar):
+            return self.sidebar[index]
+        return ("conversations", -1)
+
+    def current_project(self) -> store.Project | None:
+        """The project selected in the sidebar, or None for the combined view."""
+        kind, index = self.sidebar_choice()
+        if kind != "conversations" or index < 0:
             return None
         try:
-            return self.projects[index - 1]
+            return self.projects[index]
         except IndexError:
             return None
+
+    def current_scope(self) -> memories_mod.Scope | None:
+        """The memory scope selected in the sidebar."""
+        kind, index = self.sidebar_choice()
+        if kind != "memories":
+            return None
+        try:
+            return self.scopes[index]
+        except IndexError:
+            return None
+
+    def show_middle(self) -> None:
+        """Fill the middle pane with whichever kind the sidebar points at."""
+        kind, _ = self.sidebar_choice()
+        if kind == "heading":
+            return
+        self.mode = "memories" if kind == "memories" else "conversations"
+        memories = self.mode == "memories"
+        self.query_one("#middle-title", Static).update("Memories" if memories else "Conversations")
+        self.query_one("#detail-title", Static).update(
+            "Open memory" if memories else "Open conversation"
+        )
+        self.query_one("#legend", Static).update(
+            "✓ still true  ! out of date  ? unclear  u not in MEMORY.md" if memories else store.LEGEND
+        )
+        if memories:
+            self.show_memories()
+        else:
+            self.show_conversations()
 
     def show_conversations(self) -> None:
         """Fill the table, keeping the open conversation selected where it still appears."""
@@ -232,19 +289,93 @@ class ChatManager(App):
         self.show_detail()
 
     def marks(self, convo: store.Conversation) -> str:
-        """The summary and verdict marks for one row."""
-        summary = summarize.load(convo.session_id)
-        review = summarize.load_review(convo.session_id)
-        first = "✓" if summary and not summary.stale(convo) else ("~" if summary else " ")
-        second = VERDICT_MARKS.get(review.verdict, " ") if review else " "
-        return f"{first}{second}"
+        """The status glyphs for one row."""
+        return store.marks(
+            convo, summarize.load(convo.session_id), summarize.load_review(convo.session_id)
+        )
+
+    def show_memories(self) -> None:
+        """Fill the table with the selected scope's memories."""
+        scope = self.current_scope()
+        pool = list(scope.memories) if scope else []
+        if self.filter_text:
+            needle = self.filter_text.lower()
+            pool = [
+                m
+                for m in pool
+                if needle in (m.name + m.description + m.kind + m.body).lower()
+            ]
+        self.shown_memories = pool
+
+        table = self.query_one("#conversations", DataTable)
+        table.clear(columns=True)
+        table.add_columns(" ", "when", "kind", "name", "description")
+        for memory in pool:
+            check = summarize.load_memory_check(memory)
+            mark = {"current": "✓", "stale": "!"}.get(check.verdict, "?") if check else " "
+            table.add_row(
+                f"{mark}{'' if memory.indexed else 'u'}",
+                memory.age,
+                memory.kind,
+                memory.name,
+                memory.description,
+                key=memory.name,
+            )
+        if not any(m.name == self.open_memory for m in pool):
+            self.open_memory = pool[0].name if pool else None
+        if self.open_memory:
+            index = next(i for i, m in enumerate(pool) if m.name == self.open_memory)
+            table.move_cursor(row=index)
+        self.show_detail()
+
+    def opened_memory(self) -> memories_mod.Memory | None:
+        """The memory shown on the right."""
+        return next((m for m in self.shown_memories if m.name == self.open_memory), None)
+
+    def memory_detail(self) -> None:
+        """Update the right hand pane for the open memory."""
+        memory = self.opened_memory()
+        meta = self.query_one("#meta", Static)
+        body = self.query_one("#body", Markdown)
+        if not memory:
+            meta.update("")
+            body.update("*No memory selected.*")
+            return
+        bits = [
+            memory.scope,
+            memory.kind or "no type",
+            f"{memory.modified:%Y-%m-%d %H:%M}",
+            memory.size_human,
+        ]
+        if not memory.indexed:
+            bits.append("not in MEMORY.md")
+        if memory.links:
+            bits.append(f"links: {', '.join(memory.links)}")
+        meta.update(f"{memory.name}\n{memory.path}\n" + " · ".join(bits))
+        if self.busy:
+            return
+
+        parts = [f"*{memory.description}*" if memory.description else "", memory.body]
+        check = summarize.load_memory_check(memory)
+        parts.append("## Is it still true?")
+        if not check:
+            parts.append("*Not checked — press `c` to check it against the project.*")
+        else:
+            parts.append(f"**Verdict: {check.label}**")
+            parts.extend(f"- {line}" for line in check.lines)
+            if check.note:
+                parts.append(check.note)
+        body.update("\n\n".join(part for part in parts if part))
 
     def opened(self) -> store.Conversation | None:
         """The conversation shown on the right, which every action works on."""
         return next((c for c in self.shown if c.session_id == self.open_id), None)
 
     def show_detail(self) -> None:
-        """Update the right hand pane for the open conversation."""
+        """Update the right hand pane for whatever is open."""
+        if self.mode == "memories":
+            self.memory_detail()
+            return
         convo = self.opened()
         meta = self.query_one("#meta", Static)
         body = self.query_one("#body", Markdown)
@@ -259,7 +390,7 @@ class ChatManager(App):
             f"{convo.tool_calls} tool calls · {store.human_size(convo.size)}"
             + (f" · {tokens:,} tokens" if tokens else "")
             + (f" · branch {convo.git_branch}" if convo.git_branch else "")
-            + ("\nStill being written to — a session may have it open." if convo.live else "")
+            + (f"\n{store.STATE_WORDS[convo.state].capitalize()}." if convo.state else "")
         )
         if self.busy:
             return
@@ -293,14 +424,20 @@ class ChatManager(App):
 
     @on(ListView.Highlighted, "#projects")
     def project_changed(self) -> None:
-        """Show the conversations of the newly highlighted project."""
-        self.show_conversations()
+        """Show whatever the newly highlighted sidebar entry holds."""
+        self.show_middle()
 
     @on(DataTable.RowHighlighted, "#conversations")
     def row_changed(self, event: DataTable.RowHighlighted) -> None:
-        """Open whichever conversation the cursor moved to."""
+        """Open whichever row the cursor moved to."""
         key = event.row_key.value if event.row_key else None
-        if key and key != self.open_id:
+        if not key:
+            return
+        if self.mode == "memories":
+            if key != self.open_memory:
+                self.open_memory = key
+                self.show_detail()
+        elif key != self.open_id:
             self.open_id = key
             self.show_detail()
 
@@ -308,7 +445,7 @@ class ChatManager(App):
     def filter_changed(self, event: Input.Changed) -> None:
         """Apply the filter as it is typed."""
         self.filter_text = event.value
-        self.show_conversations()
+        self.show_middle()
 
     @on(Input.Submitted, "#filter")
     def filter_done(self) -> None:
@@ -329,7 +466,7 @@ class ChatManager(App):
         box.value = ""
         box.remove_class("visible")
         self.filter_text = ""
-        self.show_conversations()
+        self.show_middle()
         self.query_one("#conversations", DataTable).focus()
 
     def action_refresh(self) -> None:
@@ -339,6 +476,9 @@ class ChatManager(App):
 
     def action_summarize(self) -> None:
         """Summarize the open conversation unless a current summary exists."""
+        if self.mode == "memories":
+            self.notify("Memories are not summarized — press c to check one.")
+            return
         convo = self.opened()
         if not convo:
             return
@@ -354,7 +494,16 @@ class ChatManager(App):
             self.start("summary", convo)
 
     def action_check(self) -> None:
-        """Check the open conversation's outstanding items unless that was already done."""
+        """Check the open item, unless that was already done."""
+        if self.mode == "memories":
+            memory = self.opened_memory()
+            if not memory:
+                return
+            if summarize.load_memory_check(memory):
+                self.notify("Already checked — press C to check again.")
+                return
+            self.start("memory", memory)
+            return
         convo = self.opened()
         if not convo:
             return
@@ -365,33 +514,40 @@ class ChatManager(App):
         self.start("review", convo)
 
     def action_recheck(self) -> None:
-        """Check the open conversation's outstanding items again."""
+        """Check the open item again."""
+        if self.mode == "memories":
+            if memory := self.opened_memory():
+                self.start("memory", memory)
+            return
         if convo := self.opened():
             self.start("review", convo)
 
-    def start(self, kind: str, convo: store.Conversation) -> None:
+    def start(self, kind: str, subject) -> None:
         """Run a summary or a check in a worker thread."""
         if self.busy:
             self.notify("Already working on one.")
             return
         self.busy = True
-        waiting = (
-            "*Summarizing the conversation…*"
-            if kind == "summary"
-            else f"*Checking the outstanding items against `{convo.project_path}`…*"
-        )
+        waiting = {
+            "summary": "*Summarizing the conversation…*",
+            "review": f"*Checking the outstanding items against `{getattr(subject, 'project_path', '')}`…*",
+            "memory": "*Checking whether this memory is still true…*",
+        }[kind]
         self.query_one("#body", Markdown).update(waiting)
-        self.worker(kind, convo)
+        self.worker(kind, subject)
 
     @work(thread=True)
-    def worker(self, kind: str, convo: store.Conversation) -> None:
+    def worker(self, kind: str, subject) -> None:
         """Run the CLI off the UI thread and show the result."""
         try:
             if kind == "summary":
-                result = summarize.run(convo, self.cfg)
+                result = summarize.run(subject, self.cfg)
                 message = f"Summarized in {result.seconds}s"
+            elif kind == "review":
+                result = summarize.review(subject, self.cfg)
+                message = f"Checked in {result.seconds}s — {result.label}"
             else:
-                result = summarize.review(convo, self.cfg)
+                result = summarize.check_memory(subject, self.cfg)
                 message = f"Checked in {result.seconds}s — {result.label}"
         except summarize.SummaryError as exc:
             self.call_from_thread(self.finished, f"Failed: {exc}", True)
@@ -402,10 +558,20 @@ class ChatManager(App):
         """Clear the busy state and redraw."""
         self.busy = False
         self.notify(message, severity="error" if failed else "information")
-        self.show_conversations()
+        self.show_middle()
 
     def action_delete(self) -> None:
-        """Ask before deleting the open conversation."""
+        """Ask before deleting whatever is open."""
+        if self.mode == "memories":
+            memory = self.opened_memory()
+            if not memory:
+                return
+            detail = (
+                f"{memory.name}\n\n{memory.path}\n{memory.description}\n\n"
+                "Its pointer line in MEMORY.md goes with it."
+            )
+            self.push_screen(Confirm("Delete this memory?", detail), self.delete_memory_answered)
+            return
         convo = self.opened()
         if not convo:
             return
@@ -430,6 +596,17 @@ class ChatManager(App):
         where = store.delete(convo, self.cfg)
         summarize.forget(convo.session_id)
         self.open_id = None
+        self.notify("Deleted" if where == "deleted" else f"Moved to {Path(where).name}")
+        self.load()
+
+    def delete_memory_answered(self, confirmed: bool | None) -> None:
+        """Carry out a confirmed deletion of the memory that was open."""
+        memory = self.opened_memory()
+        if not confirmed or not memory:
+            return
+        where = memories_mod.delete(memory, self.cfg)
+        summarize.forget_memory_check(memory)
+        self.open_memory = None
         self.notify("Deleted" if where == "deleted" else f"Moved to {Path(where).name}")
         self.load()
 
@@ -463,7 +640,7 @@ class ChatManager(App):
         """Write the open conversation's summary, check and transcript to the current directory."""
         from . import render
 
-        convo = self.opened()
+        convo = self.opened() if self.mode == "conversations" else None
         if not convo:
             return
         summary = summarize.load(convo.session_id)

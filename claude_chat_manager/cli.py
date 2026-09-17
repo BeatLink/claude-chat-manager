@@ -9,6 +9,7 @@ from pathlib import Path
 from dataclasses import asdict
 
 from . import config as config_mod
+from . import memories as memories_mod
 from . import store, summarize
 
 
@@ -166,6 +167,90 @@ def cmd_prune(args, cfg) -> int:
     return 0
 
 
+def cmd_memory(args, cfg) -> int:
+    """List, show, check or delete the memory files."""
+    scopes = memories_mod.load_scopes(cfg)
+    action = args.memory_action or "list"
+
+    if action == "list":
+        for scope in scopes:
+            marker = "" if scope.exists else "  (project gone)"
+            print(f"\n{scope.name}  —  {scope.path}{marker}")
+            for memory in scope.memories:
+                check = summarize.load_memory_check(memory)
+                mark = {"current": "✓", "stale": "!"}.get(check.verdict, "?") if check else " "
+                flag = " " if memory.indexed else "u"
+                print(
+                    f"  {mark}{flag} {memory.age:>10}  {memory.kind[:9]:9}  {memory.name[:44]:46}"
+                    f"  {memory.description[:60]}"
+                )
+        totals = memories_mod.stats(scopes)
+        print(
+            f"\n{totals['memories']} memories in {totals['scopes']} scopes, "
+            f"{store.human_size(totals['bytes'])}"
+        )
+        return 0
+
+    if action == "health":
+        everywhere = memories_mod.all_names(scopes)
+        for scope in scopes:
+            problems = []
+            for memory in scope.unindexed:
+                problems.append(f"  not in MEMORY.md: {memory.name}")
+            for line in scope.orphan_index_lines:
+                problems.append(f"  points at a missing file: {line.strip()}")
+            for name, links in scope.dead_links(everywhere).items():
+                problems.append(f"  {name} links to missing: {', '.join(links)}")
+            if problems:
+                print(f"\n{scope.name}")
+                print("\n".join(problems))
+        totals = memories_mod.stats(scopes)
+        print(
+            f"\n{totals['unindexed']} unindexed, {totals['orphans']} orphaned index lines"
+            if totals["unindexed"] or totals["orphans"]
+            else "\nevery memory is indexed and every index line has its file"
+        )
+        return 0
+
+    memory = memories_mod.find(scopes, args.name or "")
+    if not memory:
+        return _fail(f"no memory matching {args.name!r}")
+
+    if action == "show":
+        print(f"{memory.name}  ({memory.kind}, {memory.scope})")
+        print(f"{memory.path}\n")
+        print(memory.description + "\n")
+        print(memory.body)
+        return 0
+
+    if action == "check":
+        if not args.force:
+            cached = summarize.load_memory_check(memory)
+            if cached:
+                _print_review(cached)
+                return 0
+        try:
+            result = summarize.check_memory(memory, cfg)
+        except summarize.SummaryError as exc:
+            return _fail(str(exc))
+        _print_review(result)
+        return 0
+
+    if action == "delete":
+        print(f"{memory.name}\n  {memory.path}\n  {memory.description}")
+        if not args.yes:
+            if input("delete this memory? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("left alone")
+                return 0
+        where = memories_mod.delete(memory, cfg, purge=args.purge)
+        summarize.forget_memory_check(memory)
+        print("purged" if where == "deleted" else f"moved to {where}")
+        print("its line in MEMORY.md went with it")
+        return 0
+
+    return _fail(f"unknown memory action {action!r}")
+
+
 def cmd_config(args, cfg) -> int:
     """Show the settings, or write the default file so it can be edited."""
     if args.init:
@@ -257,6 +342,21 @@ def build_parser() -> argparse.ArgumentParser:
     prune = subs.add_parser("prune", help="remove project directories with no conversations left")
     prune.add_argument("-y", "--yes", action="store_true", help="do not ask first")
     prune.set_defaults(func=cmd_prune)
+
+    memory = subs.add_parser("memory", help="list, show, check or delete the memory files")
+    memory_subs = memory.add_subparsers(dest="memory_action")
+    memory_subs.add_parser("list", help="every memory, grouped by scope")
+    memory_subs.add_parser("health", help="unindexed memories, orphaned pointers and dead links")
+    show = memory_subs.add_parser("show", help="print one memory")
+    show.add_argument("name")
+    check = memory_subs.add_parser("check", help="check whether a memory is still true")
+    check.add_argument("name")
+    check.add_argument("-f", "--force", action="store_true", help="ignore a cached check")
+    remove = memory_subs.add_parser("delete", help="delete a memory and its index line")
+    remove.add_argument("name")
+    remove.add_argument("-y", "--yes", action="store_true", help="do not ask first")
+    remove.add_argument("--purge", action="store_true", help="delete outright instead of trashing")
+    memory.set_defaults(func=cmd_memory, name=None, force=False, yes=False, purge=False)
 
     conf = subs.add_parser("config", help="show or initialise the settings")
     conf.add_argument("--init", action="store_true", help="write the default config file")

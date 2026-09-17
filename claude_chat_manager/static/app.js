@@ -1,9 +1,16 @@
 "use strict";
 
 const state = { projects: [], summaries: {}, reviews: {}, stats: {}, trash: 0, trashDir: "",
-                project: null, session: null, filter: "", promptTab: "summary" };
+                scopes: [], checks: {}, memoryStats: {},
+                mode: "conversations", project: null, scope: null, session: null, memory: null,
+                filter: "", promptTab: "summary" };
 
 const $ = (id) => document.getElementById(id);
+
+const STATE_WORDS = {
+    live: "a session is writing to this conversation now",
+    archived: "archived out of the editor's session list",
+};
 
 function toast(message) {
     const node = $("toast");
@@ -17,28 +24,46 @@ function escapeHtml(text) {
     return text.replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
 }
 
-/* Renders the small slice of markdown that summaries use. */
+/* Renders the small slice of markdown that summaries and memories use. */
 function markdown(text) {
     const out = [];
     let list = false;
+    let paragraph = [];
+    const inline = (s) => s
+        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    /* Source lines are hard wrapped, so a paragraph is rejoined and the browser wraps it. */
+    const flush = () => {
+        if (paragraph.length) out.push(`<p>${inline(paragraph.join(" "))}</p>`);
+        paragraph = [];
+    };
+    const closeList = () => {
+        if (list) out.push("</ul>");
+        list = false;
+    };
+
     for (const raw of escapeHtml(text).split("\n")) {
         const line = raw.trim();
-        const inline = (s) => s
-            .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-            .replace(/`([^`]+)`/g, "<code>$1</code>")
-            .replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+        if (!line) { flush(); closeList(); continue; }
         if (/^[-*]\s+/.test(line)) {
+            flush();
             if (!list) { out.push("<ul>"); list = true; }
             out.push(`<li>${inline(line.replace(/^[-*]\s+/, ""))}</li>`);
             continue;
         }
-        if (list) { out.push("</ul>"); list = false; }
-        if (!line) continue;
-        if (/^#{1,6}\s/.test(line)) out.push(`<h3>${inline(line.replace(/^#+\s*/, ""))}</h3>`);
-        else if (/^\*\*[^*]+\*\*$/.test(line)) out.push(`<h3>${inline(line).replace(/<\/?strong>/g, "")}</h3>`);
-        else out.push(`<p>${inline(line)}</p>`);
+        /* A wrapped continuation of the bullet above belongs to that bullet, not to a new paragraph. */
+        if (list && !paragraph.length && out.length && out[out.length - 1].endsWith("</li>")) {
+            out[out.length - 1] = out[out.length - 1].replace(/<\/li>$/, " " + inline(line) + "</li>");
+            continue;
+        }
+        closeList();
+        if (/^#{1,6}\s/.test(line)) { flush(); out.push(`<h3>${inline(line.replace(/^#+\s*/, ""))}</h3>`); }
+        else if (/^\*\*[^*]+\*\*$/.test(line)) { flush(); out.push(`<h3>${inline(line).replace(/<\/?strong>/g, "")}</h3>`); }
+        else paragraph.push(line);
     }
-    if (list) out.push("</ul>");
+    flush();
+    closeList();
     return out.join("\n");
 }
 
@@ -51,6 +76,10 @@ async function api(path, options) {
 
 async function load(refresh) {
     if (refresh) await api("/api/refresh", { method: "POST" });
+    const memoryData = await api("/api/memories");
+    state.scopes = memoryData.scopes;
+    state.checks = memoryData.checks || {};
+    state.memoryStats = memoryData.stats || {};
     const data = await api("/api/projects");
     state.projects = data.projects;
     state.summaries = data.summaries;
@@ -60,9 +89,9 @@ async function load(refresh) {
     state.trashDir = data.trash_dir || "";
     $("showtrash").textContent = state.trash ? `Trash (${state.trash})` : "Trash";
     $("stats").textContent =
-        `${data.stats.conversations} conversations · ${data.stats.projects} projects`;
-    drawProjects();
-    drawConversations();
+        `${data.stats.conversations} conversations · ${state.memoryStats.memories || 0} memories`;
+    drawSidebar();
+    drawMiddle();
 }
 
 function conversations() {
@@ -76,25 +105,164 @@ function conversations() {
     return hits.sort((a, b) => b.mtime - a.mtime);
 }
 
-function drawProjects() {
+function drawSidebar() {
     const root = $("projects");
     root.innerHTML = "";
-    const all = document.createElement("div");
-    all.className = "row" + (state.project === null ? " active" : "");
-    all.innerHTML = `<div class="name"><span class="title">All projects</span>
-        <span class="count">${state.stats.conversations ?? 0}</span></div>`;
-    all.onclick = () => { state.project = null; drawProjects(); drawConversations(); };
-    root.append(all);
 
-    for (const project of state.projects) {
+    const heading = (text) => {
+        const node = document.createElement("div");
+        node.className = "group";
+        node.textContent = text;
+        root.append(node);
+    };
+    const entry = (title, sub, count, active, onclick) => {
         const row = document.createElement("div");
-        row.className = "row" + (state.project === project.slug ? " active" : "");
-        row.innerHTML = `<div class="name"><span class="title">${escapeHtml(project.name)}</span>
-            <span class="count">${project.conversations.length}</span></div>
-            <div class="sub">${escapeHtml(project.path)}${project.exists ? "" : " · gone"}</div>`;
-        row.onclick = () => { state.project = project.slug; drawProjects(); drawConversations(); };
+        row.className = "row" + (active ? " active" : "");
+        row.innerHTML = `<div class="name"><span class="title">${escapeHtml(title)}</span>
+            <span class="count">${count}</span></div>
+            ${sub ? `<div class="sub">${escapeHtml(sub)}</div>` : ""}`;
+        row.onclick = onclick;
+        root.append(row);
+    };
+
+    heading("Conversations");
+    entry("All projects", "", state.stats.conversations ?? 0,
+        state.mode === "conversations" && state.project === null,
+        () => { state.mode = "conversations"; state.project = null; drawSidebar(); drawMiddle(); });
+    for (const project of state.projects) {
+        entry(project.name, project.path + (project.exists ? "" : " · gone"),
+            project.conversations.length,
+            state.mode === "conversations" && state.project === project.slug,
+            () => { state.mode = "conversations"; state.project = project.slug; drawSidebar(); drawMiddle(); });
+    }
+
+    heading("Memories");
+    for (const scope of state.scopes) {
+        entry(scope.name, scope.path, scope.memories.length,
+            state.mode === "memories" && state.scope === scope.slug,
+            () => { state.mode = "memories"; state.scope = scope.slug; drawSidebar(); drawMiddle(); });
+    }
+}
+
+function memories() {
+    const scope = state.scopes.find((s) => s.slug === state.scope) || state.scopes[0];
+    if (!scope) return [];
+    const needle = state.filter.toLowerCase();
+    return needle
+        ? scope.memories.filter((m) =>
+            `${m.name} ${m.description} ${m.kind} ${m.body}`.toLowerCase().includes(needle))
+        : scope.memories.slice();
+}
+
+let drawMiddle = function () {
+    $("search").placeholder = state.mode === "memories" ? "Filter memories" : "Filter conversations";
+    if (state.mode === "memories") drawMemories(); else drawConversations();
+};
+
+function drawMemories() {
+    const root = $("conversations");
+    root.innerHTML = "";
+    const rows = memories();
+    if (!rows.length) {
+        root.innerHTML = '<p class="empty" style="padding:16px">Nothing here.</p>';
+        drawMemoryDetail();
+        return;
+    }
+    if (!rows.some((m) => m.name === state.memory)) state.memory = rows[0].name;
+    let openRow = null;
+    for (const memory of rows) {
+        const check = state.checks[memory.name];
+        const mark = (check ? ({ current: "✓", stale: "!" }[check.verdict] || "?") : "")
+            + (memory.indexed ? "" : "u");
+        const row = document.createElement("div");
+        row.className = "row" + (memory.name === state.memory ? " active" : "");
+        row.innerHTML = `<div class="name"><span class="title">${escapeHtml(memory.name)}</span>
+            <span class="mark">${mark}</span></div>
+            <div class="sub">${escapeHtml(memory.kind || "no type")} · ${memory.age} · ${memory.size_human}
+            ${memory.indexed ? "" : " · not in MEMORY.md"}</div>`;
+        row.onclick = () => { state.memory = memory.name; drawMemories(); };
+        if (memory.name === state.memory) openRow = row;
         root.append(row);
     }
+    if (openRow) openRow.scrollIntoView({ block: "nearest" });
+    drawMemoryDetail();
+}
+
+function drawMemoryDetail() {
+    const memory = memories().find((m) => m.name === state.memory);
+    const root = $("detail");
+    if (!memory) {
+        root.innerHTML = '<p class="empty">Select a memory.</p>';
+        return;
+    }
+    const check = state.checks[memory.name];
+    const bits = [memory.scope, memory.kind || "no type", memory.modified, memory.size_human];
+    if (!memory.indexed) bits.push("not in MEMORY.md");
+    if (memory.links.length) bits.push("links: " + memory.links.join(", "));
+    const verdictClass = check
+        ? (check.verdict === "current" ? "safe" : check.verdict === "stale" ? "keep" : "")
+        : "";
+    root.innerHTML = `
+        <h2>${escapeHtml(memory.name)}</h2>
+        <div id="meta">${escapeHtml(bits.join(" · "))}<br>${escapeHtml(memory.path)}</div>
+        <div id="actions">
+            <button id="domemorycheck" class="primary">${check ? "Check again" : "Is it still true?"}</button>
+            <button id="domemorydelete" class="danger">Delete</button>
+        </div>
+        <div id="summary">${markdown(memory.description ? "*" + memory.description + "*\n\n" + memory.body : memory.body)}</div>
+        <div id="review">
+            <h3>Is it still true?</h3>
+            ${check
+                ? `<p><span class="verdict ${verdictClass}">${check.label}</span></p>
+                   ${check.lines.length
+                        ? "<ul>" + check.lines.map((line) => `<li>${markdownInline(line)}</li>`).join("") + "</ul>"
+                        : '<p class="empty">Nothing in it could be checked.</p>'}
+                   ${check.note ? `<p>${markdownInline(check.note)}</p>` : ""}`
+                : '<p class="empty">Not checked yet — this reads the project to see whether the memory still holds.</p>'}
+        </div>`;
+    $("domemorycheck").onclick = () => checkMemory(memory, Boolean(check));
+    $("domemorydelete").onclick = () => askDeleteMemory(memory);
+}
+
+async function checkMemory(memory, force) {
+    const button = $("domemorycheck");
+    button.disabled = true;
+    button.textContent = "Checking…";
+    try {
+        const data = await api("/api/memory-check", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: memory.name, force }),
+        });
+        state.checks[memory.name] = data;
+        toast(data.cached ? "Showed the cached check" : `Checked in ${data.seconds}s — ${data.label}`);
+        drawMemories();
+    } catch (error) {
+        toast(String(error.message || error));
+        drawMemoryDetail();
+    }
+}
+
+function askDeleteMemory(memory) {
+    $("deletedetail").textContent =
+        `${memory.name} — ${memory.description || "no description"}. Its line in MEMORY.md goes with it.`;
+    const dialog = $("deletedialog");
+    dialog.showModal();
+    $("deleteok").onclick = async () => {
+        dialog.close();
+        try {
+            await api("/api/memory-delete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: memory.name }),
+            });
+            toast("Deleted, and its index line with it");
+            state.memory = null;
+            await load(false);
+        } catch (error) {
+            toast(String(error.message || error));
+        }
+    };
 }
 
 function drawConversations() {
@@ -111,13 +279,13 @@ function drawConversations() {
     for (const convo of rows) {
         const summary = state.summaries[convo.session_id];
         const review = state.reviews[convo.session_id];
-        const marks = (summary ? (summary.stale ? "~" : "✓") : "")
-            + (review ? ({ "safe-to-delete": "✔", keep: "!", unclear: "?" }[review.verdict] || "?") : "");
-        const mark = marks;
+        const mark = (summary ? (summary.stale ? "~" : "✓") : "")
+            + (review ? ({ "safe-to-delete": "✔", keep: "!", unclear: "?" }[review.verdict] || "?") : "")
+            + ({ live: "●", archived: "▣" }[convo.state] || "");
         const row = document.createElement("div");
         row.className = "row" + (convo.session_id === state.session ? " active" : "");
         row.innerHTML = `<div class="name"><span class="title">${escapeHtml(convo.display_title)}</span>
-            <span class="mark">${mark}</span></div>
+            <span class="mark" title="${STATE_WORDS[convo.state] || ""}">${mark}</span></div>
             <div class="sub">${state.project === null ? escapeHtml(convo.project_path.split("/").pop()) + " · " : ""}
             ${convo.age} · ${convo.messages} messages · ${convo.size_human}</div>`;
         row.onclick = () => { state.session = convo.session_id; drawConversations(); };
@@ -146,6 +314,7 @@ function drawDetail() {
         `${convo.tool_calls} tool calls`, convo.size_human];
     if (tokens) bits.push(`${tokens.toLocaleString()} tokens`);
     if (convo.git_branch) bits.push(convo.git_branch);
+    if (convo.state) bits.push(STATE_WORDS[convo.state]);
     const verdictClass = review
         ? (review.verdict === "safe-to-delete" ? "safe" : review.verdict === "keep" ? "keep" : "")
         : "";
@@ -248,18 +417,21 @@ function askDelete(convo) {
 }
 
 $("deletecancel").onclick = () => $("deletedialog").close();
-$("search").oninput = (event) => { state.filter = event.target.value; drawConversations(); };
+$("search").oninput = (event) => { state.filter = event.target.value; drawMiddle(); };
 $("rescan").onclick = async () => { toast("Rescanning…"); await load(true); toast("Rescanned"); };
 
 async function openPrompt(which) {
     const cfg = await api("/api/config");
     state.promptTab = which;
-    $("prompttext").value = which === "review" ? cfg.review_prompt : cfg.summary_prompt;
+    $("prompttext").value = { review: cfg.review_prompt, memory: cfg.memory_prompt }[which]
+        || cfg.summary_prompt;
     $("tabsummary").className = which === "summary" ? "primary" : "";
     $("tabreview").className = which === "review" ? "primary" : "";
-    $("prompthint").innerHTML = which === "review"
-        ? 'Sent to <code>claude -p</code> in the project directory, with read-only tools, and must return the JSON the app parses.'
-        : 'Sent to <code>claude -p</code> with the rendered transcript on stdin.';
+    $("tabmemory").className = which === "memory" ? "primary" : "";
+    $("prompthint").innerHTML = {
+        review: 'Sent to <code>claude -p</code> with the project added and read-only tools, and must return the JSON the app parses.',
+        memory: 'Sent to <code>claude -p</code> with the directories the memory names added, and must return the same JSON shape.',
+    }[which] || 'Sent to <code>claude -p</code> with the rendered transcript on stdin.';
 }
 
 $("editprompt").onclick = async () => {
@@ -268,6 +440,7 @@ $("editprompt").onclick = async () => {
 };
 $("tabsummary").onclick = () => openPrompt("summary");
 $("tabreview").onclick = () => openPrompt("review");
+$("tabmemory").onclick = () => openPrompt("memory");
 
 $("showtrash").onclick = async () => {
     const data = await api("/api/trash");
@@ -300,4 +473,31 @@ $("promptsave").onclick = async () => {
     toast("Prompt saved");
 };
 
+/* The address bar remembers which half of the sidebar you were in, so a reload comes back to it. */
+function readHash() {
+    const [mode, slug] = decodeURIComponent(location.hash.replace(/^#/, "")).split("/");
+    if (mode === "memories") {
+        state.mode = "memories";
+        if (slug) state.scope = slug;
+    } else if (mode === "conversations") {
+        state.mode = "conversations";
+        state.project = slug || null;
+    }
+}
+
+function writeHash() {
+    const slug = state.mode === "memories" ? state.scope : state.project;
+    const next = `#${state.mode}${slug ? "/" + slug : ""}`;
+    if (location.hash !== next) history.replaceState(null, "", next);
+}
+
+const drawMiddleInner = drawMiddle;
+drawMiddle = function () {
+    writeHash();
+    drawMiddleInner();
+};
+
+window.addEventListener("hashchange", () => { readHash(); drawSidebar(); drawMiddle(); });
+
+readHash();
 load(false).catch((error) => toast(String(error.message || error)));

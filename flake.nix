@@ -16,7 +16,7 @@
             packages = forAllSystems (pkgs: {
                 default = pkgs.python3Packages.buildPythonApplication {
                     pname = "claude-chat-manager";
-                    version = "0.2.0";
+                    version = "0.3.0";
                     src = ./.;
                     pyproject = true;
                     build-system = [ pkgs.python3Packages.setuptools ];

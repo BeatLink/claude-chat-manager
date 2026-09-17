@@ -16,33 +16,54 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from . import config as config_mod  # noqa: E402
+from . import memories as memories_mod  # noqa: E402
 from . import store, summarize  # noqa: E402
 
 BOLD = re.compile(r"\*\*(.+?)\*\*")
 CODE = re.compile(r"`([^`]+)`")
 ITALIC = re.compile(r"(?<![*\w])\*([^*\n]+)\*(?!\*)")
 
-VERDICT_MARKS = {"safe-to-delete": "✔", "keep": "!", "unclear": "?"}
-
-
 def to_pango(text: str) -> str:
-    """Convert the small slice of markdown a summary uses into Pango markup."""
-    lines: list[str] = []
-    for line in html.escape(text).splitlines():
-        stripped = line.strip()
-        bullet = stripped.startswith(("- ", "* "))
-        if bullet:
-            line = "  • " + stripped[2:]
+    """Convert the small slice of markdown a summary or a memory uses into Pango markup."""
+    blocks: list[str] = []
+    paragraph: list[str] = []
+    in_list = False
+
+    def flush() -> None:
+        """Emit the paragraph built so far as one wrapped line."""
+        if paragraph:
+            blocks.append(" ".join(paragraph))
+            paragraph.clear()
+
+    for raw in html.escape(text).splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            flush()
+            in_list = False
+            continue
+        if stripped.startswith(("- ", "* ")):
+            flush()
+            blocks.append("  • " + stripped[2:])
+            in_list = True
+        elif in_list and not paragraph:
+            # A wrapped continuation of the bullet above belongs to that bullet.
+            blocks[-1] += " " + stripped
         elif stripped.startswith("#"):
-            line = f"<span size='large' weight='bold'>{stripped.lstrip('# ')}</span>"
-        line = BOLD.sub(r"<b>\1</b>", line)
-        line = ITALIC.sub(r"<i>\1</i>", line)
-        line = CODE.sub(r"<tt>\1</tt>", line)
-        lines.append(line)
-        # A blank line after each bullet, so a list of findings is not a wall of text.
-        if bullet:
-            lines.append("")
-    return "\n".join(lines).strip()
+            flush()
+            in_list = False
+            blocks.append(f"<span size='large' weight='bold'>{stripped.lstrip('# ')}</span>")
+        else:
+            # Source lines are hard wrapped, so a paragraph is rejoined and left to the label to wrap.
+            paragraph.append(stripped)
+    flush()
+
+    out = []
+    for block in blocks:
+        block = BOLD.sub(r"<b>\1</b>", block)
+        block = ITALIC.sub(r"<i>\1</i>", block)
+        block = CODE.sub(r"<tt>\1</tt>", block)
+        out.append(block)
+    return "\n\n".join(out).strip()
 
 
 class Window(Adw.ApplicationWindow):
@@ -54,9 +75,14 @@ class Window(Adw.ApplicationWindow):
         )
         self.cfg = cfg
         self.projects: list[store.Project] = []
+        self.scopes: list[memories_mod.Scope] = []
+        self.sidebar: list[tuple[str, int]] = []
         self.shown: list[store.Conversation] = []
-        self.project_index = 0
+        self.shown_memories: list[memories_mod.Memory] = []
+        self.sidebar_index = 1
+        self.mode = "conversations"
         self.open_id: str | None = None
+        self.open_memory: str | None = None
         self.filter_text = ""
         self.busy = False
         self.selecting = False
@@ -75,6 +101,7 @@ class Window(Adw.ApplicationWindow):
         """Header bar holding the search box and the action buttons."""
         header = Adw.HeaderBar()
         self.search = Gtk.SearchEntry(placeholder_text="Filter conversations", width_chars=24)
+        self.search.set_tooltip_text(store.LEGEND)
         self.search.connect("search-changed", self.on_search)
         header.pack_start(self.search)
 
@@ -126,8 +153,8 @@ class Window(Adw.ApplicationWindow):
         self.review_label = Gtk.Label(
             xalign=0, yalign=0, wrap=True, selectable=True, use_markup=True
         )
-        heading = Gtk.Label(xalign=0, label="Outstanding items check")
-        heading.add_css_class("heading")
+        self.check_heading = Gtk.Label(xalign=0, label="Outstanding items check")
+        self.check_heading.add_css_class("heading")
 
         box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
@@ -142,7 +169,7 @@ class Window(Adw.ApplicationWindow):
             self.meta_label,
             self.summary_label,
             Gtk.Separator(),
-            heading,
+            self.check_heading,
             self.verdict_label,
             self.review_label,
         ):
@@ -160,19 +187,67 @@ class Window(Adw.ApplicationWindow):
     # Data ---------------------------------------------------------------------------------------
 
     def reload(self, refresh: bool = False) -> None:
-        """Rescan and rebuild both lists."""
+        """Rescan the transcripts and the memories, and rebuild the sidebar."""
         self.projects = store.load_projects(self.cfg, refresh=refresh)
+        self.scopes = memories_mod.load_scopes(self.cfg)
+        self.selecting = True
         while row := self.project_list.get_row_at_index(0):
             self.project_list.remove(row)
+        self.sidebar = []
         totals = store.stats(self.projects)
+
+        self.project_list.append(self.heading_row("Conversations"))
+        self.sidebar.append(("heading", 0))
         self.project_list.append(self.project_row("All projects", "", totals["conversations"]))
-        for project in self.projects:
+        self.sidebar.append(("conversations", -1))
+        for index, project in enumerate(self.projects):
             subtitle = project.path if project.exists else f"{project.path}  (gone)"
             self.project_list.append(
                 self.project_row(project.name, subtitle, len(project.conversations))
             )
-        self.project_list.select_row(self.project_list.get_row_at_index(self.project_index))
-        self.fill_conversations()
+            self.sidebar.append(("conversations", index))
+
+        self.project_list.append(self.heading_row("Memories"))
+        self.sidebar.append(("heading", 0))
+        for index, scope in enumerate(self.scopes):
+            self.project_list.append(
+                self.project_row(scope.name, scope.path, len(scope.memories))
+            )
+            self.sidebar.append(("memories", index))
+
+        self.sidebar_index = min(self.sidebar_index, len(self.sidebar) - 1)
+        self.selecting = False
+        chosen = self.project_list.get_row_at_index(self.sidebar_index)
+        self.project_list.select_row(chosen)
+        chosen.grab_focus()
+        self.fill_middle()
+
+    def heading_row(self, text: str) -> Gtk.ListBoxRow:
+        """A non-selectable divider between the two halves of the sidebar."""
+        label = Gtk.Label(label=text, xalign=0, margin_top=10, margin_start=6, margin_bottom=2)
+        label.add_css_class("heading")
+        label.add_css_class("dim-label")
+        row = Gtk.ListBoxRow(child=label, selectable=False, activatable=False)
+        return row
+
+    def fill_middle(self) -> None:
+        """Fill the middle pane with whichever kind the sidebar points at."""
+        kind, _ = self.sidebar[self.sidebar_index] if self.sidebar else ("conversations", -1)
+        if kind == "heading":
+            return
+        self.mode = "memories" if kind == "memories" else "conversations"
+        self.summary_button.set_sensitive(self.mode == "conversations")
+        self.check_button.set_label("Check memory" if self.mode == "memories" else "Check items")
+        self.check_heading.set_label(
+            "Is it still true?" if self.mode == "memories" else "Outstanding items check"
+        )
+        self.search.set_placeholder_text(
+            "Filter memories" if self.mode == "memories" else "Filter conversations"
+        )
+        if self.mode == "memories":
+            self.fill_memories()
+        else:
+            self.fill_conversations()
 
     def project_row(self, title: str, subtitle: str, count: int) -> Adw.ActionRow:
         """One row in the project sidebar."""
@@ -182,13 +257,61 @@ class Window(Adw.ApplicationWindow):
         row.add_suffix(Gtk.Label(label=str(count), css_classes=["dim-label"]))
         return row
 
+    def current_index(self) -> int:
+        """Which project or scope the sidebar points at."""
+        return self.sidebar[self.sidebar_index][1] if self.sidebar else -1
+
+    def fill_memories(self) -> None:
+        """Rebuild the middle list from the selected memory scope."""
+        index = self.current_index()
+        pool = list(self.scopes[index].memories) if 0 <= index < len(self.scopes) else []
+        if self.filter_text:
+            needle = self.filter_text.lower()
+            pool = [
+                m for m in pool if needle in (m.name + m.description + m.kind + m.body).lower()
+            ]
+        self.shown_memories = pool
+
+        self.selecting = True
+        while row := self.convo_list.get_row_at_index(0):
+            self.convo_list.remove(row)
+        for memory in pool:
+            check = summarize.load_memory_check(memory)
+            mark = {"current": "✓", "stale": "!"}.get(check.verdict, "?") if check else ""
+            subtitle = f"{memory.kind or 'no type'} · {memory.age} · {memory.size_human}"
+            if not memory.indexed:
+                subtitle += " · not in MEMORY.md"
+            row = Adw.ActionRow(
+                title=GLib.markup_escape_text(memory.name),
+                subtitle=GLib.markup_escape_text(subtitle),
+            )
+            row.set_title_lines(1)
+            if mark:
+                row.add_prefix(Gtk.Label(label=mark, css_classes=["accent"]))
+            self.convo_list.append(row)
+
+        if not any(m.name == self.open_memory for m in pool):
+            self.open_memory = pool[0].name if pool else None
+        index = next((i for i, m in enumerate(pool) if m.name == self.open_memory), -1)
+        self.selecting = False
+        if index >= 0:
+            row = self.convo_list.get_row_at_index(index)
+            self.convo_list.select_row(row)
+            row.grab_focus()
+        self.show_detail()
+
+    def opened_memory(self) -> memories_mod.Memory | None:
+        """The memory shown on the right."""
+        return next((m for m in self.shown_memories if m.name == self.open_memory), None)
+
     def fill_conversations(self) -> None:
         """Rebuild the middle list, keeping the open conversation selected."""
+        index = self.current_index()
         pool = (
             [c for p in self.projects for c in p.conversations]
-            if self.project_index == 0
-            else list(self.projects[self.project_index - 1].conversations)
-            if self.project_index - 1 < len(self.projects)
+            if index < 0
+            else list(self.projects[index].conversations)
+            if index < len(self.projects)
             else []
         )
         if self.filter_text:
@@ -205,18 +328,14 @@ class Window(Adw.ApplicationWindow):
         while row := self.convo_list.get_row_at_index(0):
             self.convo_list.remove(row)
         for convo in pool:
-            summary = summarize.load(convo.session_id)
-            review = summarize.load_review(convo.session_id)
-            marks = []
-            if summary:
-                marks.append("✓" if not summary.stale(convo) else "~")
-            if review:
-                marks.append(VERDICT_MARKS.get(review.verdict, "?"))
+            marks = store.marks(
+                convo, summarize.load(convo.session_id), summarize.load_review(convo.session_id)
+            ).strip()
             subtitle = (
                 f"{store.human_age(convo.mtime)} · {convo.messages} messages · "
                 f"{store.human_size(convo.size)}"
             )
-            if self.project_index == 0:
+            if index < 0:
                 subtitle = f"{Path(convo.project_path).name} · {subtitle}"
             row = Adw.ActionRow(
                 title=GLib.markup_escape_text(convo.display_title),
@@ -224,14 +343,14 @@ class Window(Adw.ApplicationWindow):
             )
             row.set_title_lines(1)
             if marks:
-                row.add_prefix(Gtk.Label(label="".join(marks), css_classes=["accent"]))
+                row.add_prefix(Gtk.Label(label=marks, css_classes=["accent"]))
+            if convo.state:
+                row.set_tooltip_text(store.STATE_WORDS[convo.state])
             self.convo_list.append(row)
 
         if not any(c.session_id == self.open_id for c in pool):
             self.open_id = pool[0].session_id if pool else None
-        index = next(
-            (i for i, c in enumerate(pool) if c.session_id == self.open_id), -1
-        )
+        index = next((i for i, c in enumerate(pool) if c.session_id == self.open_id), -1)
         self.selecting = False
         if index >= 0:
             row = self.convo_list.get_row_at_index(index)
@@ -245,7 +364,10 @@ class Window(Adw.ApplicationWindow):
         return next((c for c in self.shown if c.session_id == self.open_id), None)
 
     def show_detail(self) -> None:
-        """Update the right hand pane from the open conversation."""
+        """Update the right hand pane from whatever is open."""
+        if self.mode == "memories":
+            self.show_memory_detail()
+            return
         convo = self.opened()
         if convo is None:
             self.title_label.set_text("")
@@ -266,8 +388,8 @@ class Window(Adw.ApplicationWindow):
             bits.append(f"{tokens:,} tokens")
         if convo.git_branch:
             bits.append(convo.git_branch)
-        if convo.live:
-            bits.append("still being written to")
+        if convo.state:
+            bits.append(store.STATE_WORDS[convo.state])
         self.title_label.set_text(convo.display_title)
         self.meta_label.set_text(" · ".join(bits) + f"\n{convo.session_id}")
         if self.busy:
@@ -297,28 +419,67 @@ class Window(Adw.ApplicationWindow):
             body += "\n\n<i>This check predates the newest messages.</i>"
         self.review_label.set_markup(body)
 
+    def show_memory_detail(self) -> None:
+        """Update the right hand pane for the open memory."""
+        memory = self.opened_memory()
+        if memory is None:
+            self.title_label.set_text("")
+            self.meta_label.set_text("")
+            self.summary_label.set_markup("<i>No memory selected.</i>")
+            self.verdict_label.set_markup("")
+            self.review_label.set_markup("")
+            return
+        bits = [memory.scope, memory.kind or "no type", f"{memory.modified:%Y-%m-%d %H:%M}",
+                memory.size_human]
+        if not memory.indexed:
+            bits.append("not in MEMORY.md")
+        if memory.links:
+            bits.append("links: " + ", ".join(memory.links))
+        self.title_label.set_text(memory.name)
+        self.meta_label.set_text(" · ".join(bits) + f"\n{memory.path}")
+        if self.busy:
+            return
+        description = f"<i>{GLib.markup_escape_text(memory.description)}</i>\n\n" if memory.description else ""
+        self.summary_label.set_markup(description + to_pango(memory.body))
+        check = summarize.load_memory_check(memory)
+        if not check:
+            self.verdict_label.set_markup("")
+            self.review_label.set_markup(
+                "<i>Not checked — press Check memory to test it against the project.</i>"
+            )
+            return
+        self.verdict_label.set_markup(f"<b>Verdict: {check.label}</b>")
+        body = to_pango("\n".join(f"- {line}" for line in check.lines) or "Nothing to check.")
+        if check.note:
+            body += f"\n{to_pango(check.note)}"
+        self.review_label.set_markup(body)
+
     # Events -------------------------------------------------------------------------------------
 
     def on_project_selected(self, _list, row) -> None:
-        """Switch the middle list to another project."""
-        if row is None:
+        """Switch the middle list to another project or memory scope."""
+        if row is None or self.selecting:
             return
-        self.project_index = row.get_index()
-        self.fill_conversations()
+        self.sidebar_index = row.get_index()
+        self.fill_middle()
 
     def on_conversation_selected(self, _list, row) -> None:
-        """Open whichever conversation was clicked."""
+        """Open whichever row was clicked, in either mode."""
         if row is None or self.selecting:
             return
         index = row.get_index()
-        if 0 <= index < len(self.shown):
+        if self.mode == "memories":
+            if 0 <= index < len(self.shown_memories):
+                self.open_memory = self.shown_memories[index].name
+                self.show_detail()
+        elif 0 <= index < len(self.shown):
             self.open_id = self.shown[index].session_id
             self.show_detail()
 
     def on_search(self, entry) -> None:
         """Filter as the user types."""
         self.filter_text = entry.get_text()
-        self.fill_conversations()
+        self.fill_middle()
 
     def toast(self, message: str) -> None:
         """Show a transient message."""
@@ -327,9 +488,30 @@ class Window(Adw.ApplicationWindow):
     # Actions ------------------------------------------------------------------------------------
 
     def start(self, kind: str, force: bool) -> None:
-        """Summarize or check the open conversation in a background thread."""
+        """Summarize or check whatever is open, in a background thread."""
+        if self.busy:
+            return
+        if self.mode == "memories":
+            memory = self.opened_memory()
+            if not memory:
+                return
+            self.busy = True
+            self.check_button.set_sensitive(False)
+            self.review_label.set_markup("<i>Checking whether this memory is still true…</i>")
+
+            def memory_worker() -> None:
+                try:
+                    result = summarize.check_memory(memory, self.cfg)
+                    message = f"Checked in {result.seconds}s — {result.label}"
+                except summarize.SummaryError as exc:
+                    GLib.idle_add(self.finished, f"Failed: {exc}")
+                    return
+                GLib.idle_add(self.finished, message)
+
+            threading.Thread(target=memory_worker, daemon=True).start()
+            return
         convo = self.opened()
-        if not convo or self.busy:
+        if not convo:
             return
         cached = (
             summarize.load(convo.session_id)
@@ -337,7 +519,7 @@ class Window(Adw.ApplicationWindow):
             else summarize.load_review(convo.session_id)
         )
         if cached and not cached.stale(convo) and not force:
-            self.toast("Already done — hold shift on the button to run it again.")
+            self.toast("Already done — the button runs it again.")
         self.busy = True
         self.summary_button.set_sensitive(False)
         self.check_button.set_sensitive(False)
@@ -369,11 +551,27 @@ class Window(Adw.ApplicationWindow):
         self.summary_button.set_sensitive(True)
         self.check_button.set_sensitive(True)
         self.toast(message)
-        self.fill_conversations()
+        self.fill_middle()
         return False
 
     def confirm_delete(self) -> None:
-        """Ask before deleting the open conversation."""
+        """Ask before deleting whatever is open."""
+        if self.mode == "memories":
+            memory = self.opened_memory()
+            if not memory:
+                return
+            dialog = Adw.AlertDialog(
+                heading="Delete this memory?",
+                body=f"{memory.name}\n\n{memory.path}\n\n{memory.description}\n\n"
+                "Its pointer line in MEMORY.md goes with it.",
+            )
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("delete", "Delete")
+            dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_default_response("cancel")
+            dialog.connect("response", self.delete_memory_answered, memory)
+            dialog.present(self)
+            return
         convo = self.opened()
         if not convo:
             return
@@ -404,6 +602,16 @@ class Window(Adw.ApplicationWindow):
         self.toast("Deleted" if where == "deleted" else f"Moved to {Path(where).name}")
         self.reload()
 
+    def delete_memory_answered(self, _dialog, response: str, memory) -> None:
+        """Carry out a confirmed deletion of the memory that was open."""
+        if response != "delete":
+            return
+        where = memories_mod.delete(memory, self.cfg)
+        summarize.forget_memory_check(memory)
+        self.open_memory = None
+        self.toast("Deleted" if where == "deleted" else f"Moved to {Path(where).name}")
+        self.reload()
+
     def edit_prompts(self) -> None:
         """Open both prompts for editing."""
         window = Adw.Window(
@@ -414,6 +622,7 @@ class Window(Adw.ApplicationWindow):
         for key, label, default in (
             ("summary_prompt", "Summary", config_mod.DEFAULT_SUMMARY_PROMPT),
             ("review_prompt", "Outstanding items", config_mod.DEFAULT_REVIEW_PROMPT),
+            ("memory_prompt", "Memory check", config_mod.DEFAULT_MEMORY_PROMPT),
         ):
             view = Gtk.TextView(
                 wrap_mode=Gtk.WrapMode.WORD,

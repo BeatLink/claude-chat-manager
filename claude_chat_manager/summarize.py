@@ -19,7 +19,7 @@ class SummaryError(RuntimeError):
     """Raised when the claude CLI is missing, fails, or returns nothing."""
 
 
-VERDICT = re.compile(r"(safe-to-delete|keep|unclear)", re.IGNORECASE)
+VERDICT = re.compile(r"(safe-to-delete|keep|unclear|current|stale)", re.IGNORECASE)
 
 FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
@@ -27,9 +27,17 @@ VERDICT_LABELS = {
     "safe-to-delete": "safe to delete",
     "keep": "still open",
     "unclear": "unclear",
+    "current": "still true",
+    "stale": "out of date",
 }
 
-STATE_LABELS = {"done": "done", "open": "still open", "unknown": "cannot tell"}
+STATE_LABELS = {
+    "done": "done",
+    "open": "still open",
+    "unknown": "cannot tell",
+    "true": "still true",
+    "false": "no longer true",
+}
 
 
 @dataclass
@@ -324,4 +332,100 @@ def review(
     )
     if cache:
         store_review(checked)
+    return checked
+
+
+def _memory_check_dir() -> Path:
+    """Directory holding cached memory checks."""
+    path = config_mod.data_dir() / "memory-checks"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def load_memory_check(memory) -> Review | None:
+    """Read a cached check of one memory, or None when there is not one."""
+    path = _memory_check_dir() / f"{memory.scope}-{memory.name}.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    try:
+        return Review(**data)
+    except TypeError:
+        return None
+
+
+def forget_memory_check(memory) -> None:
+    """Drop a cached check, used when its memory is deleted."""
+    (_memory_check_dir() / f"{memory.scope}-{memory.name}.json").unlink(missing_ok=True)
+
+
+def check_memory(memory, cfg: config_mod.Config | None = None, prompt: str | None = None) -> Review:
+    """Check whether one memory file is still true of the project or machine it describes."""
+    from . import memories as memories_mod
+
+    cfg = cfg or config_mod.load()
+    prompt = prompt if prompt is not None else cfg.memory_prompt
+    if not shutil.which(cfg.claude_bin):
+        raise SummaryError(f"{cfg.claude_bin} is not on PATH")
+
+    directories = memories_mod.mentioned_dirs(memory)
+    body = (
+        f"MEMORY FILE: {memory.path}\n"
+        f"SCOPE: {memory.scope}\n"
+        + (f"PROJECT DIRECTORY: {memory.project_path}\n" if memory.project_path else "")
+        + (f"DIRECTORIES IT MENTIONS: {', '.join(directories)}\n" if directories else "")
+        + "\nTHE MEMORY\n----------\n"
+        f"{memory.description}\n\n{memory.body}\n----------\n"
+    )
+
+    argv = [cfg.claude_bin, "-p", prompt, "--no-session-persistence", "--strict-mcp-config"]
+    if cfg.model:
+        argv += ["--model", cfg.model]
+    if cfg.review_system_prompt:
+        argv += ["--append-system-prompt", cfg.review_system_prompt]
+    argv += list(cfg.extra_claude_args)
+    for directory in directories:
+        argv += ["--add-dir", directory]
+    if cfg.review_tools:
+        argv += ["--allowedTools", *cfg.review_tools]
+
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            argv,
+            input=body,
+            capture_output=True,
+            text=True,
+            cwd=workdir(),
+            timeout=cfg.review_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SummaryError(f"claude timed out after {cfg.review_timeout}s") from exc
+    except OSError as exc:
+        raise SummaryError(f"could not run {cfg.claude_bin}: {exc}") from exc
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise SummaryError(detail[-1] if detail else f"claude exited {result.returncode}")
+    text = (result.stdout or "").strip()
+    if not text:
+        raise SummaryError("claude returned an empty check")
+
+    verdict, items, note = parse_review(text)
+    checked = Review(
+        session_id=f"{memory.scope}-{memory.name}",
+        text=text,
+        verdict=verdict,
+        items=items,
+        note=note,
+        project_path=memory.project_path,
+        prompt=prompt,
+        created=time.time(),
+        source_mtime=memory.mtime,
+        seconds=round(time.monotonic() - started, 1),
+    )
+    (_memory_check_dir() / f"{memory.scope}-{memory.name}.json").write_text(
+        json.dumps(asdict(checked), indent=2) + "\n"
+    )
     return checked
