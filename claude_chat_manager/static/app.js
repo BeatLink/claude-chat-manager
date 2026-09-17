@@ -1,6 +1,7 @@
 "use strict";
 
-const state = { projects: [], summaries: {}, stats: {}, project: null, session: null, filter: "" };
+const state = { projects: [], summaries: {}, reviews: {}, stats: {}, trash: 0, trashDir: "",
+                project: null, session: null, filter: "", promptTab: "summary" };
 
 const $ = (id) => document.getElementById(id);
 
@@ -53,7 +54,11 @@ async function load(refresh) {
     const data = await api("/api/projects");
     state.projects = data.projects;
     state.summaries = data.summaries;
+    state.reviews = data.reviews || {};
     state.stats = data.stats;
+    state.trash = data.trash || 0;
+    state.trashDir = data.trash_dir || "";
+    $("showtrash").textContent = state.trash ? `Trash (${state.trash})` : "Trash";
     $("stats").textContent =
         `${data.stats.conversations} conversations · ${data.stats.projects} projects`;
     drawProjects();
@@ -102,9 +107,13 @@ function drawConversations() {
         return;
     }
     if (!rows.some((c) => c.session_id === state.session)) state.session = rows[0].session_id;
+    let openRow = null;
     for (const convo of rows) {
         const summary = state.summaries[convo.session_id];
-        const mark = summary ? (summary.stale ? "~" : "✓") : "";
+        const review = state.reviews[convo.session_id];
+        const marks = (summary ? (summary.stale ? "~" : "✓") : "")
+            + (review ? ({ "safe-to-delete": "✔", keep: "!", unclear: "?" }[review.verdict] || "?") : "");
+        const mark = marks;
         const row = document.createElement("div");
         row.className = "row" + (convo.session_id === state.session ? " active" : "");
         row.innerHTML = `<div class="name"><span class="title">${escapeHtml(convo.display_title)}</span>
@@ -112,8 +121,10 @@ function drawConversations() {
             <div class="sub">${state.project === null ? escapeHtml(convo.project_path.split("/").pop()) + " · " : ""}
             ${convo.age} · ${convo.messages} messages · ${convo.size_human}</div>`;
         row.onclick = () => { state.session = convo.session_id; drawConversations(); };
+        if (convo.session_id === state.session) openRow = row;
         root.append(row);
     }
+    if (openRow) openRow.scrollIntoView({ block: "nearest" });
     drawDetail();
 }
 
@@ -129,24 +140,69 @@ function drawDetail() {
         return;
     }
     const summary = state.summaries[convo.session_id];
+    const review = state.reviews[convo.session_id];
     const tokens = convo.input_tokens + convo.output_tokens;
     const bits = [convo.project_path, convo.modified, `${convo.messages} messages`,
         `${convo.tool_calls} tool calls`, convo.size_human];
     if (tokens) bits.push(`${tokens.toLocaleString()} tokens`);
     if (convo.git_branch) bits.push(convo.git_branch);
+    const verdictClass = review
+        ? (review.verdict === "safe-to-delete" ? "safe" : review.verdict === "keep" ? "keep" : "")
+        : "";
     root.innerHTML = `
         <h2>${escapeHtml(convo.display_title)}</h2>
         <div id="meta">${escapeHtml(bits.join(" · "))}<br>${convo.session_id}</div>
         <div id="actions">
             <button id="dosummarize" class="primary">${summary ? "Re-summarize" : "Summarize"}</button>
+            <button id="docheck">${review ? "Check again" : "Check outstanding items"}</button>
             <button id="dodelete" class="danger">Delete</button>
         </div>
         <div id="summary">${summary
             ? markdown(summary.text) + (summary.stale
                 ? '<p class="empty">This summary predates the newest messages.</p>' : "")
-            : '<p class="empty">No summary yet.</p>'}</div>`;
+            : '<p class="empty">No summary yet.</p>'}</div>
+        <div id="review">
+            <h3>Outstanding items check</h3>
+            ${review
+                ? `<p><span class="verdict ${verdictClass}">${review.label}</span></p>
+                   ${review.lines.length
+                        ? "<ul>" + review.lines.map((line) => `<li>${markdownInline(line)}</li>`).join("") + "</ul>"
+                        : '<p class="empty">No outstanding items were listed.</p>'}
+                   ${review.note ? `<p>${markdownInline(review.note)}</p>` : ""}
+                   ${review.stale ? '<p class="empty">This check predates the newest messages.</p>' : ""}`
+                : '<p class="empty">Not checked yet — this reads the project to see whether the outstanding items were dealt with.</p>'}
+        </div>`;
     $("dosummarize").onclick = () => summarize(convo, Boolean(summary));
+    $("docheck").onclick = () => check(convo, Boolean(review));
     $("dodelete").onclick = () => askDelete(convo);
+}
+
+/* Bold, code and italics inside one line, without the block handling. */
+function markdownInline(text) {
+    return escapeHtml(text)
+        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+        .replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+
+async function check(convo, force) {
+    const button = $("docheck");
+    button.disabled = true;
+    button.textContent = "Checking…";
+    $("review").innerHTML = `<h3>Outstanding items check</h3>
+        <p class="empty">Reading ${escapeHtml(convo.project_path)} to see what was dealt with…</p>`;
+    try {
+        const data = await api("/api/review", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: convo.session_id, force }),
+        });
+        state.reviews[convo.session_id] = { ...data, stale: false };
+        toast(data.cached ? "Showed the cached check" : `Checked in ${data.seconds}s — ${data.label}`);
+        drawConversations();
+    } catch (error) {
+        toast(String(error.message || error));
+        drawDetail();
+    }
 }
 
 async function summarize(convo, force) {
@@ -195,26 +251,50 @@ $("deletecancel").onclick = () => $("deletedialog").close();
 $("search").oninput = (event) => { state.filter = event.target.value; drawConversations(); };
 $("rescan").onclick = async () => { toast("Rescanning…"); await load(true); toast("Rescanned"); };
 
-$("editprompt").onclick = async () => {
+async function openPrompt(which) {
     const cfg = await api("/api/config");
-    $("prompttext").value = cfg.summary_prompt;
+    state.promptTab = which;
+    $("prompttext").value = which === "review" ? cfg.review_prompt : cfg.summary_prompt;
+    $("tabsummary").className = which === "summary" ? "primary" : "";
+    $("tabreview").className = which === "review" ? "primary" : "";
+    $("prompthint").innerHTML = which === "review"
+        ? 'Sent to <code>claude -p</code> in the project directory, with read-only tools, and must return the JSON the app parses.'
+        : 'Sent to <code>claude -p</code> with the rendered transcript on stdin.';
+}
+
+$("editprompt").onclick = async () => {
+    await openPrompt("summary");
     $("promptdialog").showModal();
 };
+$("tabsummary").onclick = () => openPrompt("summary");
+$("tabreview").onclick = () => openPrompt("review");
+
+$("showtrash").onclick = async () => {
+    const data = await api("/api/trash");
+    $("trashpath").textContent = data.dir;
+    $("trashlist").innerHTML = data.entries.length
+        ? data.entries.map((e) => `<div class="row"><div class="name">
+             <span class="title">${escapeHtml(e.project_path.split("/").pop() || e.project_slug)}</span>
+             <span class="count">${e.size_human}</span></div>
+             <div class="sub">${e.session_id} · deleted ${e.age}</div></div>`).join("")
+        : '<p class="empty">Nothing in the trash.</p>';
+    $("trashdialog").showModal();
+};
+$("trashclose").onclick = () => $("trashdialog").close();
 $("promptcancel").onclick = () => $("promptdialog").close();
 $("promptdefault").onclick = async () => {
     await api("/api/prompt", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: "" }),
+        body: JSON.stringify({ which: state.promptTab, prompt: "" }),
     });
-    const cfg = await api("/api/config");
-    $("prompttext").value = cfg.summary_prompt;
+    await openPrompt(state.promptTab);
 };
 $("promptsave").onclick = async () => {
     await api("/api/prompt", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: $("prompttext").value }),
+        body: JSON.stringify({ which: state.promptTab, prompt: $("prompttext").value }),
     });
     $("promptdialog").close();
     toast("Prompt saved");

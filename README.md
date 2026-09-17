@@ -12,7 +12,7 @@ the same data and share the same settings:
 | `claude-chat-manager` (or `ccm`) | Textual terminal interface |
 | `claude-chat-manager gtk` | GTK4 / libadwaita window |
 | `claude-chat-manager web` | local web interface at `http://127.0.0.1:8765` |
-| `ccm list`, `ccm summarize`, `ccm delete`, `ccm prune` | plain command line |
+| `ccm list`, `ccm summarize`, `ccm review`, `ccm delete`, `ccm trash`, `ccm prune` | plain command line |
 
 ## Summarizing
 
@@ -27,6 +27,19 @@ conversation was about, what was done, and what is still outstanding.
 
 Summaries are cached in `~/.local/share/claude-chat-manager/summaries/`. A cached summary is marked `✓` in the
 list, or `~` when the conversation has grown since it was written.
+
+## Checking the outstanding items
+
+The other button takes the outstanding items from a summary and asks whether they were ever dealt
+with. It runs `claude -p` again — this time with the conversation's own project directory added and
+only read-only tools allowed (`Read`, `Grep`, `Glob` and a few `git` commands) — and gets back one
+finding per item: **done**, **still open** or **cannot tell**, each with the path, line, commit or
+setting it found. It ends with a verdict of *safe to delete*, *still open* or *unclear*, shown
+beside the conversation in the list as `✔`, `!` or `?`.
+
+The check never edits anything. It runs from an empty working directory with the project added, so
+the project's own hooks do not fire, and it asks for its answer as JSON so the tool can read the
+verdict rather than guess at it.
 
 ## Deleting
 
@@ -64,6 +77,10 @@ standard library.
 | `claude_bin` | `claude` | the CLI used for summaries |
 | `model` | *(empty)* | model for summaries, empty for the CLI default |
 | `summary_prompt` | see above | the prompt sent with every transcript |
+| `review_prompt` | see above | the prompt for the outstanding-items check |
+| `review_system_prompt` | see above | keeps the check read-only and machine-readable |
+| `review_tools` | `Read`, `Grep`, `Glob`, `git` | the tools the check is allowed to use |
+| `review_timeout` | `900` | seconds before a check is given up on |
 | `include_thinking` | `false` | include thinking blocks in the rendered transcript |
 | `include_tool_calls` | `true` | include a one-line note per tool call |
 | `include_tool_results` | `false` | include truncated tool output |

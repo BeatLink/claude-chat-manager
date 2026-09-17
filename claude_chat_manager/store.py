@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 from dataclasses import asdict, dataclass, field
@@ -15,6 +16,12 @@ INDEX_VERSION = 3
 
 # Records that carry conversation content rather than editor or session bookkeeping.
 CONTENT_TYPES = {"user", "assistant"}
+
+# A trashed file is named <stamp>-<project slug>-<session id>; the id is matched whole because it has dashes of its own.
+TRASH_NAME = re.compile(
+    r"^(?P<stamp>\d{8}-\d{6})-(?P<slug>.+)-"
+    r"(?P<session>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
 
 
 @dataclass
@@ -51,6 +58,11 @@ class Conversation:
     def modified(self) -> datetime:
         """Last write time as a local datetime."""
         return datetime.fromtimestamp(self.mtime)
+
+    @property
+    def live(self) -> bool:
+        """Whether the transcript was written to in the last two minutes, so a session may still be in it."""
+        return (time.time() - self.mtime) < 120
 
     @property
     def display_title(self) -> str:
@@ -352,6 +364,68 @@ def prune_empty(cfg: config_mod.Config | None = None) -> list[Path]:
             continue
         removed.append(directory)
     return removed
+
+
+def trash_dir(cfg: config_mod.Config | None = None) -> Path:
+    """Where deleted conversations are kept."""
+    path = config_mod.data_dir() / "trash"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def trashed(cfg: config_mod.Config | None = None) -> list[dict]:
+    """The deleted conversations still recoverable, newest first."""
+    out = []
+    for path in trash_dir(cfg).glob("*.jsonl"):
+        stat = path.stat()
+        found = TRASH_NAME.match(path.stem)
+        slug = found.group("slug") if found else ""
+        session_id = found.group("session") if found else path.stem
+        out.append(
+            {
+                "path": str(path),
+                "name": path.name,
+                "session_id": session_id,
+                "project_slug": slug,
+                "project_path": unslug(slug) if slug else "",
+                "deleted": stat.st_mtime,
+                "age": human_age(stat.st_mtime),
+                "size": stat.st_size,
+                "size_human": human_size(stat.st_size),
+            }
+        )
+    out.sort(key=lambda entry: entry["deleted"], reverse=True)
+    return out
+
+
+def restore(entry: dict, cfg: config_mod.Config | None = None) -> Path:
+    """Put a trashed conversation back where it came from."""
+    cfg = cfg or config_mod.load()
+    source = Path(entry["path"])
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    target_dir = cfg.projects_path / entry["project_slug"]
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{entry['session_id']}.jsonl"
+    if target.exists():
+        raise FileExistsError(target)
+    shutil.move(str(source), target)
+    sidecar = source.with_suffix("")
+    if sidecar.is_dir():
+        shutil.move(str(sidecar), target.with_suffix(""))
+    return target
+
+
+def empty_trash(cfg: config_mod.Config | None = None) -> int:
+    """Delete everything in the trash for good, and say how many went."""
+    entries = trashed(cfg)
+    for entry in entries:
+        path = Path(entry["path"])
+        path.unlink(missing_ok=True)
+        sidecar = path.with_suffix("")
+        if sidecar.is_dir():
+            shutil.rmtree(sidecar, ignore_errors=True)
+    return len(entries)
 
 
 def stats(projects: list[Project]) -> dict:

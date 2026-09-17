@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from dataclasses import asdict
 
 from . import config as config_mod
@@ -69,6 +70,66 @@ def cmd_summarize(args, cfg) -> int:
     except summarize.SummaryError as exc:
         return _fail(str(exc))
     print(result.text)
+    return 0
+
+
+def cmd_review(args, cfg) -> int:
+    """Check whether a conversation's outstanding items have since been dealt with."""
+    projects = store.load_projects(cfg)
+    convo = store.find(projects, args.session)
+    if not convo:
+        return _fail(f"no conversation matching {args.session!r}")
+    if not args.force:
+        cached = summarize.load_review(convo.session_id)
+        if cached and not cached.stale(convo):
+            _print_review(cached)
+            return 0
+    try:
+        result = summarize.review(convo, cfg, prompt=args.prompt or None)
+    except summarize.SummaryError as exc:
+        return _fail(str(exc))
+    _print_review(result)
+    return 0
+
+
+def _print_review(review) -> None:
+    """Print a review's findings and its verdict."""
+    for line in review.lines:
+        print(f"- {line.replace('**', '')}\n")
+    if review.note:
+        print(f"{review.note}\n")
+    print(f"Verdict: {review.label}")
+
+
+def cmd_trash(args, cfg) -> int:
+    """List, restore or empty the trash."""
+    entries = store.trashed(cfg)
+    if args.empty:
+        if not args.yes and entries:
+            if input(f"delete {len(entries)} trashed conversations for good? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("left alone")
+                return 0
+        print(f"removed {store.empty_trash(cfg)}")
+        return 0
+    if args.restore:
+        matches = [e for e in entries if e["session_id"].startswith(args.restore)]
+        if len(matches) != 1:
+            return _fail(f"{len(matches)} trashed conversations match {args.restore!r}")
+        try:
+            target = store.restore(matches[0], cfg)
+        except (FileNotFoundError, FileExistsError) as exc:
+            return _fail(f"could not restore: {exc}")
+        print(f"restored to {target}")
+        return 0
+    if not entries:
+        print(f"the trash is empty ({store.trash_dir(cfg)})")
+        return 0
+    for entry in entries:
+        print(
+            f"  {entry['session_id'][:8]}  {entry['age']:>10}  {entry['size_human']:>8}  "
+            f"{Path(entry['project_path']).name}"
+        )
+    print(f"\n{len(entries)} conversations in {store.trash_dir(cfg)}")
     return 0
 
 
@@ -174,6 +235,18 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--prompt-file", help="read the prompt from a file")
     summary.add_argument("-f", "--force", action="store_true", help="ignore a cached summary")
     summary.set_defaults(func=cmd_summarize)
+
+    review = subs.add_parser("review", help="check whether the outstanding items were dealt with")
+    review.add_argument("session", help="session id or unique prefix")
+    review.add_argument("--prompt", help="override the configured review prompt")
+    review.add_argument("-f", "--force", action="store_true", help="ignore a cached review")
+    review.set_defaults(func=cmd_review)
+
+    trash = subs.add_parser("trash", help="list, restore or empty the deleted conversations")
+    trash.add_argument("--restore", metavar="SESSION", help="put a deleted conversation back")
+    trash.add_argument("--empty", action="store_true", help="delete the trash for good")
+    trash.add_argument("-y", "--yes", action="store_true", help="do not ask first")
+    trash.set_defaults(func=cmd_trash)
 
     delete = subs.add_parser("delete", help="delete a conversation")
     delete.add_argument("session", help="session id or unique prefix")

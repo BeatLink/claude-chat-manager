@@ -50,7 +50,17 @@ main > section:last-child { border-right: none; }
 #summary { max-width: 62ch; }
 #summary h3 { font-size: 14px; margin: 18px 0 6px; }
 #summary ul { padding-left: 20px; margin: 6px 0; }
-#summary li { margin: 4px 0; }
+#summary li { margin: 12px 0; }
+#summary li:first-child { margin-top: 6px; }
+#review { max-width: 62ch; margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line); }
+#review h3 { font-size: 14px; margin: 0 0 10px; }
+#review ul { padding-left: 20px; margin: 10px 0; }
+#review li { margin: 12px 0; }
+.verdict { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12.5px;
+           border: 1px solid var(--line); }
+.verdict.safe { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.verdict.keep { border-color: var(--danger); color: var(--danger); }
+.live { color: var(--danger); }
 #summary code { background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
                 padding: 0 4px; font-size: 12.5px; }
 .empty { color: var(--muted); font-style: italic; }
@@ -75,7 +85,8 @@ textarea { width: 100%; min-height: 260px; font: 13px/1.5 ui-monospace, "SF Mono
     <h1>Claude Chat Manager</h1>
     <input id="search" type="search" placeholder="Filter conversations">
     <button id="rescan">Rescan</button>
-    <button id="editprompt">Prompt</button>
+    <button id="editprompt">Prompts</button>
+    <button id="showtrash">Trash</button>
     <span id="stats"></span>
 </header>
 
@@ -89,14 +100,29 @@ textarea { width: 100%; min-height: 260px; font: 13px/1.5 ui-monospace, "SF Mono
 
 <dialog id="promptdialog">
     <div class="dialog-body">
-        <h3>Summarization prompt</h3>
-        <p class="empty">Sent to <code>claude -p</code> with the rendered transcript on stdin.</p>
+        <h3>Prompts</h3>
+        <p class="empty" id="prompthint">Sent to <code>claude -p</code> with the rendered transcript on stdin.</p>
+        <div id="prompttabs" style="display:flex; gap:8px; margin-bottom:12px">
+            <button id="tabsummary" class="primary">Summary</button>
+            <button id="tabreview">Outstanding items</button>
+        </div>
         <textarea id="prompttext"></textarea>
     </div>
     <div class="dialog-foot">
         <button id="promptdefault">Restore default</button>
         <button id="promptcancel">Cancel</button>
         <button id="promptsave" class="primary">Save</button>
+    </div>
+</dialog>
+
+<dialog id="trashdialog">
+    <div class="dialog-body">
+        <h3>Trash</h3>
+        <p class="empty" id="trashpath"></p>
+        <div id="trashlist"></div>
+    </div>
+    <div class="dialog-foot">
+        <button id="trashclose">Close</button>
     </div>
 </dialog>
 

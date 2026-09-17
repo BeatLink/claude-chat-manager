@@ -205,3 +205,92 @@ def test_summarize_requires_the_cli(cfg, monkeypatch):
     monkeypatch.setattr(summarize.shutil, "which", lambda _: None)
     with pytest.raises(summarize.SummaryError, match="not on PATH"):
         summarize.run(convo, cfg)
+
+
+def test_review_parses_the_json_reply():
+    """A well-formed reply gives the verdict, the findings and the note."""
+    reply = """```json
+    {"items": [{"item": "add the gitignore entry", "state": "open",
+                "evidence": ".gitignore has no startup-metrics line"}],
+     "verdict": "keep", "note": "one thing left"}
+    ```"""
+    verdict, items, note = summarize.parse_review(reply)
+    assert verdict == "keep"
+    assert items[0]["state"] == "open"
+    assert note == "one thing left"
+
+
+def test_review_falls_back_to_a_loose_verdict():
+    """A reply that is not JSON still yields a verdict when one is written in it."""
+    verdict, items, note = summarize.parse_review("I checked everything.\nVERDICT: safe-to-delete")
+    assert verdict == "safe-to-delete"
+    assert items == [] and note == ""
+
+
+def test_review_of_prose_is_unclear():
+    """A reply with no verdict at all is reported as unclear rather than guessed."""
+    assert summarize.parse_review("here is a chatty answer")[0] == "unclear"
+
+
+def test_review_lines_read_as_sentences():
+    """Findings render with their state in words and their evidence."""
+    review = summarize.Review(
+        session_id="x",
+        text="{}",
+        verdict="keep",
+        items=[{"item": "the gitignore entry", "state": "open", "evidence": "not present"}],
+    )
+    assert review.lines == ["**the gitignore entry** — still open. not present"]
+    assert review.label == "still open"
+
+
+def test_review_command_puts_the_prompt_before_the_list_options(cfg):
+    """The prompt comes before --add-dir and --allowedTools, which would swallow it."""
+    argv = summarize.review_command(cfg, "PROMPT", Path("/tmp/example"))
+    assert argv[2] == "PROMPT"
+    assert argv.index("PROMPT") < argv.index("--add-dir") < argv.index("--allowedTools")
+
+
+def test_review_needs_the_project_to_still_exist(cfg, monkeypatch):
+    """Checking a conversation whose project is gone is refused, not attempted."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    convo.project_path = "/tmp/definitely-not-here"
+    monkeypatch.setattr(summarize.shutil, "which", lambda _: "/usr/bin/claude")
+    with pytest.raises(summarize.SummaryError, match="is gone"):
+        summarize.review(convo, cfg)
+
+
+def test_trash_names_survive_the_session_id_dashes(cfg):
+    """A trashed file is read back with its project and session id intact."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    store.delete(convo, cfg)
+    entries = store.trashed(cfg)
+    assert len(entries) == 1
+    assert entries[0]["session_id"] == convo.session_id
+    assert entries[0]["project_slug"] == convo.project_slug
+
+
+def test_trash_restores_a_conversation(cfg):
+    """Restoring puts the transcript back in its project directory."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    store.delete(convo, cfg)
+    assert store.load_projects(cfg, refresh=True) == []
+    target = store.restore(store.trashed(cfg)[0], cfg)
+    assert target.exists()
+    assert len(store.load_projects(cfg, refresh=True)[0].conversations) == 1
+
+
+def test_emptying_the_trash_reports_what_went(cfg):
+    """Emptying removes every trashed file and counts them."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    store.delete(convo, cfg)
+    assert store.empty_trash(cfg) == 1
+    assert store.trashed(cfg) == []
+
+
+def test_live_conversations_are_flagged(cfg):
+    """A transcript written to moments ago is marked as possibly still open."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    assert convo.live
+    convo.mtime -= 600
+    assert not convo.live

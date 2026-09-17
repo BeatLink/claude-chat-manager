@@ -110,6 +110,27 @@ class Handler(BaseHTTPRequestHandler):
                         for c in p.conversations
                         if (s := summarize.load(c.session_id))
                     },
+                    "reviews": {
+                        c.session_id: {
+                            "lines": r.lines,
+                            "verdict": r.verdict,
+                            "label": r.label,
+                            "note": r.note,
+                            "stale": r.stale(c),
+                        }
+                        for p in projects
+                        for c in p.conversations
+                        if (r := summarize.load_review(c.session_id))
+                    },
+                    "trash": len(store.trashed(self.state.cfg)),
+                    "trash_dir": str(store.trash_dir(self.state.cfg)),
+                }
+            )
+        elif route == "/api/trash":
+            self.send_json(
+                {
+                    "dir": str(store.trash_dir(self.state.cfg)),
+                    "entries": store.trashed(self.state.cfg),
                 }
             )
         elif route == "/api/config":
@@ -147,6 +168,38 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, 500)
                 return
             self.send_json({"text": result.text, "seconds": result.seconds, "cached": False})
+        elif route == "/api/review":
+            convo = self.state.find(payload.get("session_id", ""))
+            if not convo:
+                self.send_json({"error": "no such conversation"}, 404)
+                return
+            cached = summarize.load_review(convo.session_id)
+            if cached and not cached.stale(convo) and not payload.get("force"):
+                self.send_json(
+                    {
+                        "lines": cached.lines,
+                        "verdict": cached.verdict,
+                        "label": cached.label,
+                        "note": cached.note,
+                        "cached": True,
+                    }
+                )
+                return
+            try:
+                result = summarize.review(convo, self.state.cfg)
+            except summarize.SummaryError as exc:
+                self.send_json({"error": str(exc)}, 500)
+                return
+            self.send_json(
+                {
+                    "lines": result.lines,
+                    "verdict": result.verdict,
+                    "label": result.label,
+                    "note": result.note,
+                    "seconds": result.seconds,
+                    "cached": False,
+                }
+            )
         elif route == "/api/delete":
             convo = self.state.find(payload.get("session_id", ""))
             if not convo:
@@ -157,10 +210,19 @@ class Handler(BaseHTTPRequestHandler):
             self.state.reload()
             self.send_json({"ok": True, "where": where})
         elif route == "/api/prompt":
+            which = payload.get("which") or "summary"
             prompt = (payload.get("prompt") or "").strip()
-            self.state.cfg.summary_prompt = prompt or config_mod.DEFAULT_SUMMARY_PROMPT
+            if which == "review":
+                self.state.cfg.review_prompt = prompt or config_mod.DEFAULT_REVIEW_PROMPT
+            else:
+                self.state.cfg.summary_prompt = prompt or config_mod.DEFAULT_SUMMARY_PROMPT
             config_mod.save(self.state.cfg)
-            self.send_json({"prompt": self.state.cfg.summary_prompt})
+            self.send_json(
+                {
+                    "summary_prompt": self.state.cfg.summary_prompt,
+                    "review_prompt": self.state.cfg.review_prompt,
+                }
+            )
         else:
             self.send_error(404)
 

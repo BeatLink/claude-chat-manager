@@ -16,19 +16,22 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from . import config as config_mod  # noqa: E402
-from . import render, store, summarize  # noqa: E402
+from . import store, summarize  # noqa: E402
 
 BOLD = re.compile(r"\*\*(.+?)\*\*")
 CODE = re.compile(r"`([^`]+)`")
 ITALIC = re.compile(r"(?<![*\w])\*([^*\n]+)\*(?!\*)")
 
+VERDICT_MARKS = {"safe-to-delete": "✔", "keep": "!", "unclear": "?"}
+
 
 def to_pango(text: str) -> str:
     """Convert the small slice of markdown a summary uses into Pango markup."""
-    lines = []
+    lines: list[str] = []
     for line in html.escape(text).splitlines():
         stripped = line.strip()
-        if stripped.startswith(("- ", "* ")):
+        bullet = stripped.startswith(("- ", "* "))
+        if bullet:
             line = "  • " + stripped[2:]
         elif stripped.startswith("#"):
             line = f"<span size='large' weight='bold'>{stripped.lstrip('# ')}</span>"
@@ -36,20 +39,27 @@ def to_pango(text: str) -> str:
         line = ITALIC.sub(r"<i>\1</i>", line)
         line = CODE.sub(r"<tt>\1</tt>", line)
         lines.append(line)
-    return "\n".join(lines)
+        # A blank line after each bullet, so a list of findings is not a wall of text.
+        if bullet:
+            lines.append("")
+    return "\n".join(lines).strip()
 
 
 class Window(Adw.ApplicationWindow):
-    """Main window: projects, conversations, and the summary of the selected one."""
+    """Main window: projects, conversations, and the one that is open."""
 
     def __init__(self, app: Adw.Application, cfg: config_mod.Config) -> None:
-        super().__init__(application=app, title="Claude Chat Manager", default_width=1300, default_height=800)
+        super().__init__(
+            application=app, title="Claude Chat Manager", default_width=1300, default_height=800
+        )
         self.cfg = cfg
         self.projects: list[store.Project] = []
         self.shown: list[store.Conversation] = []
         self.project_index = 0
+        self.open_id: str | None = None
         self.filter_text = ""
         self.busy = False
+        self.selecting = False
 
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(self.build_header())
@@ -70,21 +80,23 @@ class Window(Adw.ApplicationWindow):
 
         self.summary_button = Gtk.Button(label="Summarize", tooltip_text="Summarize with Claude")
         self.summary_button.add_css_class("suggested-action")
-        self.summary_button.connect("clicked", lambda *_: self.summarize(force=False))
+        self.summary_button.connect("clicked", lambda *_: self.start("summary", force=False))
         header.pack_end(self.summary_button)
 
-        redo = Gtk.Button(icon_name="media-playlist-repeat-symbolic", tooltip_text="Summarize again")
-        redo.connect("clicked", lambda *_: self.summarize(force=True))
-        header.pack_end(redo)
+        self.check_button = Gtk.Button(
+            label="Check items", tooltip_text="Check the outstanding items against the project"
+        )
+        self.check_button.connect("clicked", lambda *_: self.start("review", force=False))
+        header.pack_end(self.check_button)
 
-        delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Delete conversation")
+        delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Delete this conversation")
         delete.add_css_class("destructive-action")
         delete.connect("clicked", lambda *_: self.confirm_delete())
         header.pack_end(delete)
 
-        prompt = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Edit summary prompt")
-        prompt.connect("clicked", lambda *_: self.edit_prompt())
-        header.pack_end(prompt)
+        prompts = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Edit the prompts")
+        prompts.connect("clicked", lambda *_: self.edit_prompts())
+        header.pack_end(prompts)
 
         rescan = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Rescan transcripts")
         rescan.connect("clicked", lambda *_: self.reload(refresh=True))
@@ -107,12 +119,34 @@ class Window(Adw.ApplicationWindow):
         self.title_label.add_css_class("title-2")
         self.meta_label = Gtk.Label(xalign=0, selectable=True, wrap=True)
         self.meta_label.add_css_class("dim-label")
-        self.summary_label = Gtk.Label(xalign=0, yalign=0, wrap=True, selectable=True, use_markup=True)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=16,
-                      margin_bottom=16, margin_start=16, margin_end=16)
-        box.append(self.title_label)
-        box.append(self.meta_label)
-        box.append(self.summary_label)
+        self.summary_label = Gtk.Label(
+            xalign=0, yalign=0, wrap=True, selectable=True, use_markup=True
+        )
+        self.verdict_label = Gtk.Label(xalign=0, wrap=True, use_markup=True)
+        self.review_label = Gtk.Label(
+            xalign=0, yalign=0, wrap=True, selectable=True, use_markup=True
+        )
+        heading = Gtk.Label(xalign=0, label="Outstanding items check")
+        heading.add_css_class("heading")
+
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=14,
+            margin_top=16,
+            margin_bottom=16,
+            margin_start=16,
+            margin_end=16,
+        )
+        for widget in (
+            self.title_label,
+            self.meta_label,
+            self.summary_label,
+            Gtk.Separator(),
+            heading,
+            self.verdict_label,
+            self.review_label,
+        ):
+            box.append(widget)
         detail = Gtk.ScrolledWindow(child=box, hexpand=True)
 
         inner = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, position=430)
@@ -142,12 +176,14 @@ class Window(Adw.ApplicationWindow):
 
     def project_row(self, title: str, subtitle: str, count: int) -> Adw.ActionRow:
         """One row in the project sidebar."""
-        row = Adw.ActionRow(title=GLib.markup_escape_text(title), subtitle=GLib.markup_escape_text(subtitle))
+        row = Adw.ActionRow(
+            title=GLib.markup_escape_text(title), subtitle=GLib.markup_escape_text(subtitle)
+        )
         row.add_suffix(Gtk.Label(label=str(count), css_classes=["dim-label"]))
         return row
 
     def fill_conversations(self) -> None:
-        """Rebuild the middle list from the selected project and the search text."""
+        """Rebuild the middle list, keeping the open conversation selected."""
         pool = (
             [c for p in self.projects for c in p.conversations]
             if self.project_index == 0
@@ -158,17 +194,24 @@ class Window(Adw.ApplicationWindow):
         if self.filter_text:
             needle = self.filter_text.lower()
             pool = [
-                c for c in pool
+                c
+                for c in pool
                 if needle in (c.display_title + c.last_prompt + c.project_path).lower()
             ]
         pool.sort(key=lambda c: c.mtime, reverse=True)
         self.shown = pool
 
+        self.selecting = True
         while row := self.convo_list.get_row_at_index(0):
             self.convo_list.remove(row)
         for convo in pool:
-            cached = summarize.load(convo.session_id)
-            mark = "✓" if cached and not cached.stale(convo) else ("~" if cached else "")
+            summary = summarize.load(convo.session_id)
+            review = summarize.load_review(convo.session_id)
+            marks = []
+            if summary:
+                marks.append("✓" if not summary.stale(convo) else "~")
+            if review:
+                marks.append(VERDICT_MARKS.get(review.verdict, "?"))
             subtitle = (
                 f"{store.human_age(convo.mtime)} · {convo.messages} messages · "
                 f"{store.human_size(convo.size)}"
@@ -180,28 +223,36 @@ class Window(Adw.ApplicationWindow):
                 subtitle=GLib.markup_escape_text(subtitle),
             )
             row.set_title_lines(1)
-            if mark:
-                row.add_prefix(Gtk.Label(label=mark, css_classes=["accent"]))
+            if marks:
+                row.add_prefix(Gtk.Label(label="".join(marks), css_classes=["accent"]))
             self.convo_list.append(row)
-        if pool:
-            self.convo_list.select_row(self.convo_list.get_row_at_index(0))
-        else:
-            self.show_detail(None)
 
-    def selected(self) -> store.Conversation | None:
-        """The conversation selected in the middle list."""
-        row = self.convo_list.get_selected_row()
-        if row is None:
-            return None
-        index = row.get_index()
-        return self.shown[index] if 0 <= index < len(self.shown) else None
+        if not any(c.session_id == self.open_id for c in pool):
+            self.open_id = pool[0].session_id if pool else None
+        index = next(
+            (i for i, c in enumerate(pool) if c.session_id == self.open_id), -1
+        )
+        self.selecting = False
+        if index >= 0:
+            row = self.convo_list.get_row_at_index(index)
+            self.convo_list.select_row(row)
+            # Focusing the row is what scrolls it into view inside the scrolled window.
+            row.grab_focus()
+        self.show_detail()
 
-    def show_detail(self, convo: store.Conversation | None) -> None:
-        """Update the right hand pane."""
+    def opened(self) -> store.Conversation | None:
+        """The conversation shown on the right, which every action works on."""
+        return next((c for c in self.shown if c.session_id == self.open_id), None)
+
+    def show_detail(self) -> None:
+        """Update the right hand pane from the open conversation."""
+        convo = self.opened()
         if convo is None:
             self.title_label.set_text("")
             self.meta_label.set_text("")
             self.summary_label.set_markup("<i>No conversation selected.</i>")
+            self.verdict_label.set_markup("")
+            self.review_label.set_markup("")
             return
         tokens = convo.input_tokens + convo.output_tokens
         bits = [
@@ -215,18 +266,36 @@ class Window(Adw.ApplicationWindow):
             bits.append(f"{tokens:,} tokens")
         if convo.git_branch:
             bits.append(convo.git_branch)
+        if convo.live:
+            bits.append("still being written to")
         self.title_label.set_text(convo.display_title)
         self.meta_label.set_text(" · ".join(bits) + f"\n{convo.session_id}")
-        cached = summarize.load(convo.session_id)
         if self.busy:
             return
-        if not cached:
+
+        summary = summarize.load(convo.session_id)
+        if not summary:
             self.summary_label.set_markup("<i>No summary yet — press Summarize.</i>")
+        else:
+            text = to_pango(summary.text)
+            if summary.stale(convo):
+                text += "\n\n<i>This summary predates the newest messages.</i>"
+            self.summary_label.set_markup(text)
+
+        review = summarize.load_review(convo.session_id)
+        if not review:
+            self.verdict_label.set_markup("")
+            self.review_label.set_markup(
+                "<i>Not checked — press Check items to test them against the project.</i>"
+            )
             return
-        text = to_pango(cached.text)
-        if cached.stale(convo):
-            text += "\n\n<i>This summary predates the newest messages.</i>"
-        self.summary_label.set_markup(text)
+        self.verdict_label.set_markup(f"<b>Verdict: {review.label}</b>")
+        body = to_pango("\n".join(f"- {line}" for line in review.lines) or "No outstanding items.")
+        if review.note:
+            body += f"\n{to_pango(review.note)}"
+        if review.stale(convo):
+            body += "\n\n<i>This check predates the newest messages.</i>"
+        self.review_label.set_markup(body)
 
     # Events -------------------------------------------------------------------------------------
 
@@ -238,8 +307,13 @@ class Window(Adw.ApplicationWindow):
         self.fill_conversations()
 
     def on_conversation_selected(self, _list, row) -> None:
-        """Show the newly selected conversation."""
-        self.show_detail(self.selected())
+        """Open whichever conversation was clicked."""
+        if row is None or self.selecting:
+            return
+        index = row.get_index()
+        if 0 <= index < len(self.shown):
+            self.open_id = self.shown[index].session_id
+            self.show_detail()
 
     def on_search(self, entry) -> None:
         """Filter as the user types."""
@@ -252,50 +326,66 @@ class Window(Adw.ApplicationWindow):
 
     # Actions ------------------------------------------------------------------------------------
 
-    def summarize(self, force: bool) -> None:
-        """Summarize the selected conversation in a background thread."""
-        convo = self.selected()
+    def start(self, kind: str, force: bool) -> None:
+        """Summarize or check the open conversation in a background thread."""
+        convo = self.opened()
         if not convo or self.busy:
             return
-        cached = summarize.load(convo.session_id)
+        cached = (
+            summarize.load(convo.session_id)
+            if kind == "summary"
+            else summarize.load_review(convo.session_id)
+        )
         if cached and not cached.stale(convo) and not force:
-            self.toast("Already summarized — use the redo button to run it again.")
-            return
+            self.toast("Already done — hold shift on the button to run it again.")
         self.busy = True
         self.summary_button.set_sensitive(False)
-        self.summary_label.set_markup(f"<i>Summarizing with {self.cfg.claude_bin}…</i>")
+        self.check_button.set_sensitive(False)
+        if kind == "summary":
+            self.summary_label.set_markup(f"<i>Summarizing with {self.cfg.claude_bin}…</i>")
+        else:
+            self.review_label.set_markup(
+                f"<i>Checking the outstanding items against {GLib.markup_escape_text(convo.project_path)}…</i>"
+            )
 
         def worker() -> None:
             try:
-                result = summarize.run(convo, self.cfg)
+                if kind == "summary":
+                    result = summarize.run(convo, self.cfg)
+                    message = f"Summarized in {result.seconds}s"
+                else:
+                    result = summarize.review(convo, self.cfg)
+                    message = f"Checked in {result.seconds}s — {result.label}"
             except summarize.SummaryError as exc:
-                GLib.idle_add(self.summary_done, convo, None, str(exc))
+                GLib.idle_add(self.finished, f"Failed: {exc}")
                 return
-            GLib.idle_add(self.summary_done, convo, result, None)
+            GLib.idle_add(self.finished, message)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def summary_done(self, convo, result, error) -> bool:
-        """Put a finished summary on screen."""
+    def finished(self, message: str) -> bool:
+        """Clear the busy state and redraw."""
         self.busy = False
         self.summary_button.set_sensitive(True)
-        if error:
-            self.toast(f"Summary failed: {error}")
-        else:
-            self.toast(f"Summarized in {result.seconds}s")
-        selected = self.selected()
+        self.check_button.set_sensitive(True)
+        self.toast(message)
         self.fill_conversations()
-        if selected and selected.session_id == convo.session_id:
-            self.show_detail(convo)
         return False
 
     def confirm_delete(self) -> None:
-        """Ask before deleting the selected conversation."""
-        convo = self.selected()
+        """Ask before deleting the open conversation."""
+        convo = self.opened()
         if not convo:
             return
-        where = "moved to the trash" if self.cfg.trash_on_delete else "deleted outright"
-        body = f"{convo.display_title}\n\n{convo.path}\n\nIt will be {where}."
+        where = (
+            f"It moves to {store.trash_dir(self.cfg)} and can be restored with "
+            "ccm trash --restore."
+            if self.cfg.trash_on_delete
+            else "It is deleted outright."
+        )
+        body = f"{convo.display_title}\n\n{convo.path}\n\n{where}"
+        if convo.live:
+            body += "\n\nThis conversation was written to moments ago — a session may still have it open."
         dialog = Adw.AlertDialog(heading="Delete this conversation?", body=body)
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("delete", "Delete")
@@ -305,44 +395,62 @@ class Window(Adw.ApplicationWindow):
         dialog.present(self)
 
     def delete_answered(self, _dialog, response: str, convo) -> None:
-        """Carry out a confirmed deletion."""
+        """Carry out a confirmed deletion of the conversation that was open."""
         if response != "delete":
             return
         where = store.delete(convo, self.cfg)
         summarize.forget(convo.session_id)
+        self.open_id = None
         self.toast("Deleted" if where == "deleted" else f"Moved to {Path(where).name}")
         self.reload()
 
-    def edit_prompt(self) -> None:
-        """Open the summarization prompt for editing."""
-        window = Adw.Window(title="Summary prompt", default_width=760, default_height=520,
-                            transient_for=self, modal=True)
-        view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD, top_margin=12, bottom_margin=12,
-                            left_margin=12, right_margin=12)
-        view.get_buffer().set_text(self.cfg.summary_prompt)
+    def edit_prompts(self) -> None:
+        """Open both prompts for editing."""
+        window = Adw.Window(
+            title="Prompts", default_width=820, default_height=620, transient_for=self, modal=True
+        )
+        notebook = Gtk.Notebook(vexpand=True)
+        views = {}
+        for key, label, default in (
+            ("summary_prompt", "Summary", config_mod.DEFAULT_SUMMARY_PROMPT),
+            ("review_prompt", "Outstanding items", config_mod.DEFAULT_REVIEW_PROMPT),
+        ):
+            view = Gtk.TextView(
+                wrap_mode=Gtk.WrapMode.WORD,
+                top_margin=12,
+                bottom_margin=12,
+                left_margin=12,
+                right_margin=12,
+            )
+            view.get_buffer().set_text(getattr(self.cfg, key))
+            views[key] = (view, default)
+            notebook.append_page(Gtk.ScrolledWindow(child=view), Gtk.Label(label=label))
+
         header = Adw.HeaderBar()
         save = Gtk.Button(label="Save", css_classes=["suggested-action"])
-        default = Gtk.Button(label="Default")
+        default_button = Gtk.Button(label="Default for this tab")
         header.pack_end(save)
-        header.pack_start(default)
+        header.pack_start(default_button)
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(header)
-        toolbar.set_content(Gtk.ScrolledWindow(child=view, vexpand=True))
+        toolbar.set_content(notebook)
         window.set_content(toolbar)
 
         def on_default(*_):
-            view.get_buffer().set_text(config_mod.DEFAULT_SUMMARY_PROMPT)
+            key = list(views)[notebook.get_current_page()]
+            view, default = views[key]
+            view.get_buffer().set_text(default)
 
         def on_save(*_):
-            buffer = view.get_buffer()
-            self.cfg.summary_prompt = buffer.get_text(
-                buffer.get_start_iter(), buffer.get_end_iter(), False
-            ).strip()
+            for key, (view, _default) in views.items():
+                buffer = view.get_buffer()
+                text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+                setattr(self.cfg, key, text.strip())
             path = config_mod.save(self.cfg)
-            self.toast(f"Prompt saved to {path}")
+            self.toast(f"Prompts saved to {path}")
             window.close()
 
-        default.connect("clicked", on_default)
+        default_button.connect("clicked", on_default)
         save.connect("clicked", on_save)
         window.present()
 
