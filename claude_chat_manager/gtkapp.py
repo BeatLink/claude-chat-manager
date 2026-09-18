@@ -795,7 +795,10 @@ class Window(Adw.ApplicationWindow):
         label = ide.tab_is_open(convo.session_id, convo.project_path, self.cfg)
         if label:
             body += f"\n\nIts editor tab “{label}” is closed first."
-        if convo.live:
+        pid = leftovers.running_session(convo.session_id, self.cfg)
+        if pid:
+            body += f"\n\nA session is still running it (pid {pid}), and is stopped first."
+        elif convo.live:
             body += "\n\nThis conversation was written to moments ago — a session may still have it open."
         dialog = Adw.AlertDialog(heading="Delete this conversation?", body=body)
         dialog.add_response("cancel", "Cancel")
@@ -811,10 +814,24 @@ class Window(Adw.ApplicationWindow):
             return
         if ide.tab_is_open(convo.session_id, convo.project_path, self.cfg):
             self.toast(ide.close_tab_quietly(convo.session_id, convo.project_path, self.cfg))
-        where = store.delete(convo, self.cfg)
-        summarize.forget(convo.session_id)
         self.open_id = None
-        self.toast("Deleted" if where == "deleted" else f"Moved to {Path(where).name}")
+
+        def worker() -> None:
+            ended = leftovers.end_session(convo.session_id, self.cfg)
+            where = store.delete(convo, self.cfg)
+            summarize.forget(convo.session_id)
+            GLib.idle_add(self.delete_finished, where, ended)
+            message = store.purge_rebirth(convo)
+            if message:
+                GLib.idle_add(self.delete_finished, "", message)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def delete_finished(self, where: str, note: str) -> None:
+        """Say how a deletion went and show the list without what it removed."""
+        gone = "" if not where else ("Deleted" if where == "deleted" else f"Moved to {Path(where).name}")
+        said = "; ".join(part for part in (gone, note) if part)
+        self.toast(said[:1].upper() + said[1:])
         self.reload()
 
     def delete_memory_answered(self, _dialog, response: str, memory) -> None:

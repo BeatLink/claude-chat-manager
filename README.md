@@ -12,7 +12,7 @@ the same data and share the same settings:
 | `claude-chat-manager` (or `ccm`) | Textual terminal interface |
 | `claude-chat-manager gtk` | GTK4 / libadwaita window |
 | `claude-chat-manager web` | local web interface at `http://127.0.0.1:8765` |
-| `ccm list`, `ccm summarize`, `ccm review`, `ccm delete`, `ccm trash`, `ccm prune`, `ccm sweep`, `ccm close-tab` | plain command line |
+| `ccm list`, `ccm summarize`, `ccm review`, `ccm delete`, `ccm trash`, `ccm ghosts`, `ccm prune`, `ccm sweep`, `ccm close-tab` | plain command line |
 | a button on the conversation's tab in VS Code | the editor extension below |
 | `ccm memory list\|show\|check\|delete\|health` | the same for memory files |
 
@@ -138,6 +138,23 @@ mistake is recoverable. Set `trash_on_delete` to `false`, or pass `--purge` on t
 delete outright. `ccm prune` removes project directories that no longer hold any conversations. `ccm delete
 --everything` takes one conversation's scratchpad, session environment and file history with it.
 Scratchpads are never trashed — there is no undo for those.
+
+A conversation whose session is still open does not stay deleted on its own: within seconds the
+session writes its title, last prompt and mode back out, and that recreates the transcript with no
+messages in it. Both the editor's session list and this tool read the directory, so the conversation
+appears to be back, and reopening the editor does not help.
+
+So a delete ends the session first. `~/.claude/sessions/` says which process is running a
+conversation, and that one is stopped — wherever it is open, including the Claude side bar, which
+closing an editor tab never touches. Pass `--keep-session` to leave it alone. The path is then
+watched for a few seconds and an empty transcript that turns up is removed; one that comes back with
+real messages in it is left alone, because the session carried on rather than rewrote its title.
+Older ones are marked `◌` in every frontend and listed by `ccm ghosts`:
+
+```sh
+ccm ghosts                 # the transcripts with no messages left in them
+ccm ghosts --delete -y     # trash them
+```
 
 ## Installing
 

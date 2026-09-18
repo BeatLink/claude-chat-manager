@@ -7,7 +7,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -222,6 +224,41 @@ def session_records(cfg: config_mod.Config | None = None, measured: bool = True)
             leftover.mtime = max(leftover.mtime, mtime)
         out.append(leftover)
     return out
+
+
+def running_session(session_id: str, cfg: config_mod.Config | None = None) -> int:
+    """The process id of the session still running this conversation, or zero when none is."""
+    root = claude_dir(cfg) / "sessions"
+    if not root.is_dir():
+        return 0
+    for path in sorted(root.glob("*.json")):
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        pid = int(record.get("pid") or 0)
+        if not pid or str(record.get("sessionId") or "") != session_id:
+            continue
+        if _running(pid, str(record.get("procStart") or "")):
+            return pid
+    return 0
+
+
+def end_session(session_id: str, cfg: config_mod.Config | None = None, timeout: float = 5.0) -> str:
+    """Stop the session still running a conversation, since otherwise it writes the deleted transcript back."""
+    pid = running_session(session_id, cfg)
+    if not pid:
+        return ""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.2)
+        if not running_session(session_id, cfg):
+            return f"stopped the session that was still running it (pid {pid})"
+    return f"the session running it (pid {pid}) is still going"
 
 
 FINDERS = {

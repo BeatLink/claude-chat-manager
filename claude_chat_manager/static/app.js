@@ -10,6 +10,7 @@ const $ = (id) => document.getElementById(id);
 const STATE_WORDS = {
     live: "a session is writing to this conversation now",
     archived: "archived out of the editor's session list",
+    ghost: "no messages left, only the title a session wrote back after a delete",
 };
 
 function toast(message) {
@@ -280,7 +281,7 @@ function drawConversations() {
         const review = state.reviews[convo.session_id];
         const mark = (summary ? (summary.stale ? "~" : "✓") : "")
             + (review ? ({ "safe-to-delete": "✔", keep: "!", unclear: "?" }[review.verdict] || "?") : "")
-            + ({ live: "●", archived: "▣" }[convo.state] || "");
+            + ({ live: "●", archived: "▣", ghost: "◌" }[convo.state] || "");
         const row = document.createElement("div");
         row.className = "row" + (convo.session_id === state.session ? " active" : "");
         row.innerHTML = `<div class="name"><span class="title">${escapeHtml(convo.display_title)}</span>
@@ -500,7 +501,8 @@ function askDelete(convo) {
                 body: JSON.stringify({ session_id: convo.session_id }),
             });
             toast((data.closed ? data.closed + "; " : "")
-                + (data.where === "deleted" ? "deleted" : "moved to the trash"));
+                + (data.where === "deleted" ? "deleted" : "moved to the trash")
+                + (data.settled ? "; " + data.settled : ""));
             state.session = null;
             await load(false);
         } catch (error) {

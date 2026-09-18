@@ -64,15 +64,22 @@ class Conversation:
 
     @property
     def state(self) -> str:
-        """Whether a session is writing to this conversation, the editor has archived it, or neither."""
+        """Whether a session is writing to this conversation, it holds no messages, the editor has archived it, or none of those."""
         if self.live:
             return "live"
+        if self.ghost:
+            return "ghost"
         return "archived" if self.archived else ""
 
     @property
     def live(self) -> bool:
         """Whether the transcript was written to in the last two minutes, so a session may still be in it."""
         return (time.time() - self.mtime) < 120
+
+    @property
+    def ghost(self) -> bool:
+        """Whether nothing is left but bookkeeping, which is what a session writes back over a deleted conversation."""
+        return self.messages == 0 and not self.live
 
     @property
     def display_title(self) -> str:
@@ -361,6 +368,41 @@ def delete(convo: Conversation, cfg: config_mod.Config | None = None, purge: boo
     return destination
 
 
+# How long a delete keeps watching the path, since the session that owned it writes its title back within seconds.
+REBIRTH_SECONDS = 8.0
+
+
+def purge_rebirth(convo: Conversation, seconds: float = REBIRTH_SECONDS) -> str:
+    """Watch a deleted conversation's path, remove the empty transcript its session writes back, and report only when there was one."""
+    path = Path(convo.path)
+    removed = 0
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(0.5)
+        if not path.exists():
+            continue
+        reborn = scan(path, convo.project_slug)
+        if reborn.messages:
+            return f"it came back with {reborn.messages} messages, so it was left in place"
+        path.unlink(missing_ok=True)
+        sidecar = path.with_suffix("")
+        if sidecar.is_dir():
+            shutil.rmtree(sidecar, ignore_errors=True)
+        removed += 1
+    if not removed:
+        return ""
+    if removed == 1:
+        return "its session wrote the transcript back empty, and that was removed too"
+    return f"its session wrote the transcript back empty {removed} times, all removed"
+
+
+def ghosts(projects: list[Project]) -> list[Conversation]:
+    """Every conversation whose transcript holds no messages any more, newest first."""
+    found = [convo for project in projects for convo in project.conversations if convo.ghost]
+    found.sort(key=lambda convo: convo.mtime, reverse=True)
+    return found
+
+
 def empty_project_dirs(cfg: config_mod.Config | None = None) -> list[Path]:
     """Project directories left behind with no transcripts in them."""
     cfg = cfg or config_mod.load()
@@ -457,14 +499,15 @@ def stats(projects: list[Project]) -> dict:
     }
 
 
-STATE_MARKS = {"live": "●", "archived": "▣"}
+STATE_MARKS = {"live": "●", "archived": "▣", "ghost": "◌"}
 
 STATE_WORDS = {
     "live": "a session is writing to this conversation now",
     "archived": "archived out of the editor's session list",
+    "ghost": "no messages left, only the title a session wrote back after a delete",
 }
 
-LEGEND = "✓ summarized  ✔!? checked  ● live  ▣ archived"
+LEGEND = "✓ summarized  ✔!? checked  ● live  ▣ archived  ◌ empty"
 
 
 def marks(convo: Conversation, summary=None, review=None) -> str:

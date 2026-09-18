@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -58,6 +60,24 @@ def write_transcript(directory: Path, session_id: str, title: str = "Example ses
         "{ not json at all",
     ]
     path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def write_stub(directory: Path, session_id: str, title: str = "Deleted session") -> Path:
+    """Write the bookkeeping-only transcript a session leaves behind after its conversation is deleted."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{session_id}.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                record("ai-title", aiTitle=title, sessionId=session_id),
+                record("mode", mode="normal", sessionId=session_id),
+                record("atis-latch", atis="v1.deadbeef", sessionId=session_id),
+            ]
+        )
+        + "\n"
+    )
+    os.utime(path, (0, time.time() - 600))
     return path
 
 
@@ -296,6 +316,70 @@ def test_live_conversations_are_flagged(cfg):
     assert convo.live
     convo.mtime -= 600
     assert not convo.live
+
+
+
+
+def test_a_transcript_with_no_messages_is_a_ghost(cfg, workspace):
+    """A conversation that holds only bookkeeping is reported as empty, not as an ordinary one."""
+    write_stub(workspace / "-tmp-example", "99999999-8888-7777-6666-555555555555")
+    projects = store.load_projects(cfg, refresh=True)
+    found = store.ghosts(projects)
+    assert [convo.session_id[:8] for convo in found] == ["99999999"]
+    assert found[0].state == "ghost"
+    assert found[0].display_title == "Deleted session"
+    assert store.marks(found[0])[2] == "◌"
+
+
+def test_a_conversation_being_written_now_is_not_a_ghost(cfg):
+    """An empty transcript that was just written belongs to a session that has not said anything yet."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    convo.user_messages = convo.assistant_messages = 0
+    assert convo.live and not convo.ghost
+
+
+def test_an_empty_transcript_written_back_after_a_delete_goes(cfg, workspace):
+    """The watch after a delete removes the transcript the session writes back with nothing in it."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    store.delete(convo, cfg)
+    write_stub(workspace / "-tmp-example", convo.session_id)
+    assert "removed" in store.purge_rebirth(convo, seconds=1.5)
+    assert not Path(convo.path).exists()
+
+
+def test_a_conversation_that_carries_on_after_a_delete_is_kept(cfg, workspace):
+    """A session that keeps talking writes real messages back, and those are left alone."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    store.delete(convo, cfg)
+    write_transcript(workspace / "-tmp-example", convo.session_id)
+    assert "left in place" in store.purge_rebirth(convo, seconds=1.5)
+    assert Path(convo.path).exists()
+
+
+def test_nothing_is_said_when_a_delete_sticks(cfg):
+    """A conversation that stays deleted is reported with silence."""
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    store.delete(convo, cfg)
+    assert store.purge_rebirth(convo, seconds=1.0) == ""
+
+
+def test_a_running_session_is_found_by_its_record(cfg, tmp_path, monkeypatch):
+    """The session still running a conversation is found through the record that names its process."""
+    claude = tmp_path / "claude"
+    (claude / "sessions").mkdir(parents=True)
+    session = "11111111-2222-3333-4444-555555555555"
+    (claude / "sessions" / f"{os.getpid()}.json").write_text(
+        json.dumps({"pid": os.getpid(), "sessionId": session, "procStart": ""})
+    )
+    cfg.claude_dir = str(claude)
+    assert leftovers.running_session(session, cfg) == os.getpid()
+    assert leftovers.running_session("nobody", cfg) == 0
+
+
+def test_nothing_is_stopped_when_no_session_is_running(cfg, tmp_path):
+    """A conversation whose session has gone is deleted without anything being signalled."""
+    cfg.claude_dir = str(tmp_path / "empty")
+    assert leftovers.end_session("11111111-2222-3333-4444-555555555555", cfg) == ""
 
 
 def _write_state_db(path: Path, hidden: list[str]) -> Path:

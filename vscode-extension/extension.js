@@ -82,6 +82,9 @@ async function deleteConversation() {
             modal: true,
             detail:
                 `${describe(details)}\n\nThe tab closes and the transcript is ${fate}.` +
+                (details.running_pid
+                    ? `\nThe session still running it (pid ${details.running_pid}) is stopped, wherever it is open.`
+                    : "") +
                 (leftovers ? "\nIts scratchpad, session environment and file history are deleted outright." : ""),
         },
         "Delete",

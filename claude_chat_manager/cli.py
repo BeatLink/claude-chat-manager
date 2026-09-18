@@ -144,21 +144,60 @@ def cmd_delete(args, cfg) -> int:
     if not convo:
         return _fail(f"no conversation matching {args.session!r}")
     label = ide.tab_is_open(convo.session_id, convo.project_path, cfg)
+    pid = leftovers.running_session(convo.session_id, cfg)
     print(f"{convo.display_title}\n  {convo.path}\n  {convo.messages} messages, {store.human_size(convo.size)}")
     if label and not args.keep_tab:
         print(f"  its tab {label!r} is open in the editor and will be closed first")
+    if pid and not args.keep_session:
+        print(f"  a session is still running it (pid {pid}) and will be stopped first")
     if not args.yes:
         if input("delete this conversation? [y/N] ").strip().lower() not in ("y", "yes"):
             print("left alone")
             return 0
     if label and not args.keep_tab:
         print(ide.close_tab_quietly(convo.session_id, convo.project_path, cfg))
+    if not args.keep_session:
+        ended = leftovers.end_session(convo.session_id, cfg)
+        if ended:
+            print(ended)
     destination = store.delete(convo, cfg, purge=args.purge)
     summarize.forget(convo.session_id)
     print("purged" if destination == "deleted" else f"moved to {destination}")
+    settled = store.purge_rebirth(convo, seconds=args.settle)
+    if settled:
+        print(settled)
     if args.everything:
         count, freed = leftovers.remove_all(leftovers.for_session(convo.session_id, cfg))
         print(f"removed {count} leftovers, freeing {store.human_size(freed)}")
+    return 0
+
+
+def cmd_ghosts(args, cfg) -> int:
+    """List the conversations left as empty transcripts, and delete them when asked."""
+    found = store.ghosts(store.load_projects(cfg, refresh=True))
+    if args.json:
+        print(json.dumps([store.conversation_dict(c) for c in found], indent=2, default=str))
+        return 0
+    for convo in found:
+        print(
+            f"  {convo.session_id[:8]}  {store.human_age(convo.mtime):>10}"
+            f"  {store.human_size(convo.size):>8}  {convo.display_title}"
+        )
+    if not found:
+        print("no empty transcripts")
+        return 0
+    print(f"\n{len(found)} transcripts with no messages left in them")
+    if not args.delete:
+        print("pass --delete to remove them")
+        return 0
+    if not args.yes:
+        if input(f"delete all {len(found)}? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("left alone")
+            return 0
+    for convo in found:
+        store.delete(convo, cfg, purge=args.purge)
+        summarize.forget(convo.session_id)
+    print(f"removed {len(found)}")
     return 0
 
 
@@ -193,6 +232,7 @@ def cmd_resolve_tab(args, cfg) -> int:
                 "session_id": session_id,
                 "title": convo.display_title if convo else args.label,
                 "messages": convo.messages if convo else 0,
+                "running_pid": leftovers.running_session(session_id, cfg),
                 "size_human": store.human_size(convo.size) if convo else "",
                 "path": convo.path if convo else "",
                 "leftovers": [
@@ -449,9 +489,21 @@ def build_parser() -> argparse.ArgumentParser:
     delete.add_argument("--purge", action="store_true", help="delete outright instead of trashing")
     delete.add_argument("--keep-tab", action="store_true", help="leave its editor tab open")
     delete.add_argument(
+        "--keep-session",
+        action="store_true",
+        help="leave a session that is still running it alone",
+    )
+    delete.add_argument(
         "--everything",
         action="store_true",
         help="also remove its scratchpad, environment and file history",
+    )
+    delete.add_argument(
+        "--settle",
+        type=float,
+        default=store.REBIRTH_SECONDS,
+        metavar="SECONDS",
+        help="how long to watch for the session writing an empty transcript back",
     )
 
     resolving = subs.add_parser("resolve-tab", help="the conversation behind an editor tab")
@@ -460,6 +512,13 @@ def build_parser() -> argparse.ArgumentParser:
     resolving.add_argument("--json", action="store_true", help="print what the tab holds too")
     resolving.set_defaults(func=cmd_resolve_tab)
     delete.set_defaults(func=cmd_delete)
+
+    empties = subs.add_parser("ghosts", help="conversations left as transcripts with no messages")
+    empties.add_argument("--delete", action="store_true", help="remove them")
+    empties.add_argument("-y", "--yes", action="store_true", help="do not ask first")
+    empties.add_argument("--purge", action="store_true", help="delete outright instead of trashing")
+    empties.add_argument("--json", action="store_true")
+    empties.set_defaults(func=cmd_ghosts)
 
     prune = subs.add_parser("prune", help="remove project directories with no conversations left")
     prune.add_argument("-y", "--yes", action="store_true", help="do not ask first")

@@ -305,10 +305,12 @@ class Handler(BaseHTTPRequestHandler):
                 closed = ide.close_tab_quietly(
                     convo.session_id, convo.project_path, self.state.cfg
                 )
+            ended = leftovers.end_session(convo.session_id, self.state.cfg)
             where = store.delete(convo, self.state.cfg, purge=bool(payload.get("purge")))
             summarize.forget(convo.session_id)
+            settled = "; ".join(part for part in (ended, store.purge_rebirth(convo)) if part)
             self.state.reload()
-            self.send_json({"ok": True, "where": where, "closed": closed})
+            self.send_json({"ok": True, "where": where, "closed": closed, "settled": settled})
         elif route in ("/api/scratchpad-open", "/api/scratchpad-delete"):
             convo = self.state.find(payload.get("session_id", ""))
             pad = leftovers.scratchpad_for(convo.session_id, self.state.cfg) if convo else None

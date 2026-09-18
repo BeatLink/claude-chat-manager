@@ -660,11 +660,13 @@ class ChatManager(App):
         live = "\n\nThis conversation was written to moments ago — a session may still have it open."
         label = ide.tab_is_open(convo.session_id, convo.project_path, self.cfg)
         tab = f"\n\nIts editor tab {label!r} is closed first." if label else ""
+        pid = leftovers.running_session(convo.session_id, self.cfg)
+        running = f"\n\nA session is still running it (pid {pid}), and is stopped first."
         detail = (
             f"{convo.display_title}\n\n{convo.path}\n"
             f"{convo.messages} messages · {store.human_size(convo.size)}\n\n{where}"
             + tab
-            + (live if convo.live else "")
+            + (running if pid else live if convo.live else "")
         )
         self.push_screen(Confirm("Delete this conversation?", detail), self.delete_answered)
 
@@ -675,11 +677,22 @@ class ChatManager(App):
             return
         if ide.tab_is_open(convo.session_id, convo.project_path, self.cfg):
             self.notify(ide.close_tab_quietly(convo.session_id, convo.project_path, self.cfg))
+        self.open_id = None
+        self.delete_conversation(convo)
+
+    @work(thread=True)
+    def delete_conversation(self, convo) -> None:
+        """Stop the session still running it, delete the transcript, then remove anything written back."""
+        ended = leftovers.end_session(convo.session_id, self.cfg)
         where = store.delete(convo, self.cfg)
         summarize.forget(convo.session_id)
-        self.open_id = None
-        self.notify("Deleted" if where == "deleted" else f"Moved to {Path(where).name}")
-        self.load()
+        gone = "Deleted" if where == "deleted" else f"Moved to {Path(where).name}"
+        self.call_from_thread(self.notify, "; ".join(part for part in (gone, ended) if part))
+        self.call_from_thread(self.load)
+        message = store.purge_rebirth(convo)
+        if message:
+            self.call_from_thread(self.notify, message.capitalize())
+            self.call_from_thread(self.load)
 
     def delete_memory_answered(self, confirmed: bool | None) -> None:
         """Carry out a confirmed deletion of the memory that was open."""
