@@ -65,6 +65,37 @@ _WORKSPACE_CACHE: tuple[float, dict[str, Path]] = (0.0, {})
 WORKSPACE_CACHE_SECONDS = 30.0
 
 
+def _file_uri_path(uri: str) -> str:
+    """The local path a file:// URI names, or nothing for any other kind of URI."""
+    return unquote(uri[len("file://") :]) if uri.startswith("file://") else ""
+
+
+def _workspace_folders(marker: Path) -> list[str]:
+    """The folders one editor workspace has open, whether it holds one folder or a multi-root workspace file."""
+    try:
+        record = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return []
+    folder = _file_uri_path(str(record.get("folder") or ""))
+    if folder:
+        return [folder]
+    workspace_file = Path(_file_uri_path(str(record.get("workspace") or "")))
+    if not workspace_file.name:
+        return []
+    try:
+        entries = json.loads(workspace_file.read_text()).get("folders") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+    folders = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "") or _file_uri_path(str(entry.get("uri") or ""))
+        if path:
+            folders.append(str((workspace_file.parent / path).resolve()) if not Path(path).is_absolute() else path)
+    return folders
+
+
 def workspace_state_dbs(cfg: config_mod.Config | None = None) -> dict[str, Path]:
     """Each open project's own state database, keyed by the folder it belongs to."""
     global _WORKSPACE_CACHE
@@ -83,17 +114,11 @@ def workspace_state_dbs(cfg: config_mod.Config | None = None) -> dict[str, Path]
         marker = directory / "workspace.json"
         if not database.is_file() or not marker.is_file():
             continue
-        try:
-            folder = json.loads(marker.read_text()).get("folder") or ""
-        except (OSError, ValueError):
-            continue
-        if not folder.startswith("file://"):
-            continue
         # One folder accumulates a directory per editor install, so the freshest one is the live one.
-        name = unquote(folder[len("file://") :])
-        current = out.get(name)
-        if current is None or database.stat().st_mtime > current.stat().st_mtime:
-            out[name] = database
+        for name in _workspace_folders(marker):
+            current = out.get(name)
+            if current is None or database.stat().st_mtime > current.stat().st_mtime:
+                out[name] = database
     _WORKSPACE_CACHE = (time.time(), out)
     return out
 

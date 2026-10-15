@@ -680,6 +680,26 @@ def test_a_conversation_with_no_tab_has_no_label(editor):
     assert vscode_mod.tab_labels("/tmp/nowhere", editor) == {}
 
 
+def test_a_multi_root_workspace_maps_each_of_its_folders(editor, tmp_path):
+    import os
+    from claude_chat_manager import vscode as vscode_mod
+
+    workspace_file = tmp_path / "Workspaces" / "1" / "workspace.json"
+    workspace_file.parent.mkdir(parents=True)
+    workspace_file.write_text(json.dumps({"folders": [{"path": "/tmp/first"}, {"path": "second"}]}))
+    database = write_editor_state(
+        Path(editor.vscode_state_db).parent.parent,
+        "/tmp/multi",
+        {"panelTabSessions": [{"sessionId": "abcdabcd-0000-0000-0000-000000000000", "title": "In a multi-root window"}]},
+    )
+    (database.parent / "workspace.json").write_text(json.dumps({"workspace": f"file://{workspace_file}"}))
+    newer = database.stat().st_mtime + 10
+    os.utime(database, (newer, newer))
+    vscode_mod._WORKSPACE_CACHE = (0.0, {})
+    assert vscode_mod.tab_label("abcdabcd-0000-0000-0000-000000000000", "/tmp/first", editor) == "In a multi-root window"
+    assert vscode_mod.tab_label("abcdabcd-0000-0000-0000-000000000000", str(workspace_file.parent / "second"), editor)
+
+
 def test_archived_ids_still_read_from_global_state(editor):
     from claude_chat_manager import vscode as vscode_mod
 
