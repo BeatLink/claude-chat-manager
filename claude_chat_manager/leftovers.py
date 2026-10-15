@@ -261,6 +261,48 @@ def end_session(session_id: str, cfg: config_mod.Config | None = None, timeout: 
     return f"the session running it (pid {pid}) is still going"
 
 
+
+def parent_of(pid: int) -> int:
+    """The parent process id of a running process, or zero when it cannot be read."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return 0
+    # The command name sits in brackets and may hold spaces, so the fields are read after its closing bracket.
+    fields = stat[stat.rfind(")") + 2 :].split()
+    return int(fields[1]) if len(fields) > 1 else 0
+
+
+def is_own_ancestor(pid: int) -> bool:
+    """Whether a process is this one's parent, grandparent or further up."""
+    current = os.getppid()
+    while current > 1:
+        if current == pid:
+            return True
+        current = parent_of(current)
+    return False
+
+
+def detach(log_path: Path) -> bool:
+    """Carries on in a process of its own that outlives this one's session, writing to the log; true in that process, false in this one."""
+    first = os.fork()
+    if first:
+        os.waitpid(first, 0)
+        return False
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    quiet = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(quiet, 0)
+    os.dup2(log, 1)
+    os.dup2(log, 2)
+    os.close(quiet)
+    os.close(log)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    return True
+
 FINDERS = {
     "scratchpad": scratchpads,
     "session-env": session_envs,

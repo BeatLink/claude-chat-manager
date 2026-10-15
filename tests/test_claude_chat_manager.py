@@ -794,3 +794,42 @@ def test_an_unclosed_caveat_is_dropped_to_the_end(tmp_path):
 def test_cleaning_keeps_ordinary_text(tmp_path):
     assert render.clean("just a normal first message") == "just a normal first message"
     assert render.clean("hello <system-reminder>noise</system-reminder> there") == "hello  there"
+
+
+def test_a_process_knows_its_own_ancestors():
+    """The parent counts as an ancestor, and the process itself and a missing one do not."""
+    assert leftovers.is_own_ancestor(os.getppid())
+    assert not leftovers.is_own_ancestor(os.getpid())
+    assert leftovers.parent_of(os.getpid()) == os.getppid()
+    assert leftovers.parent_of(2**22 + 1) == 0
+
+
+def _delete_from_inside_its_session(cfg, monkeypatch, detached: bool):
+    """Runs a delete whose session is this process's parent, with detaching faked."""
+    from claude_chat_manager import cli
+
+    monkeypatch.setattr(cli.config_mod, "load", lambda: cfg)
+    monkeypatch.setattr(leftovers, "running_session", lambda *_: os.getppid())
+    monkeypatch.setattr(leftovers, "end_session", lambda *_: "stopped the session")
+    detaching = []
+    monkeypatch.setattr(leftovers, "detach", lambda log: detaching.append(log) or detached)
+    convo = store.load_projects(cfg, refresh=True)[0].conversations[0]
+    status = cli.main(["delete", "-y", "--keep-tab", "--settle", "0", convo.session_id])
+    return status, convo, detaching
+
+
+def test_a_delete_from_inside_its_own_session_hands_off_and_leaves_the_rest(cfg, monkeypatch, capsys):
+    """The command run inside the session returns at once, leaving the delete to the detached process."""
+    status, convo, detaching = _delete_from_inside_its_session(cfg, monkeypatch, detached=False)
+    assert status == 0
+    assert len(detaching) == 1
+    assert Path(convo.path).exists()
+    assert "finishes in the background" in capsys.readouterr().out
+
+
+def test_the_detached_process_finishes_a_delete_from_inside_its_own_session(cfg, monkeypatch):
+    """The process that outlives the session stops it and trashes the transcript."""
+    status, convo, detaching = _delete_from_inside_its_session(cfg, monkeypatch, detached=True)
+    assert status == 0
+    assert len(detaching) == 1
+    assert not Path(convo.path).exists()

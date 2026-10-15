@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from dataclasses import asdict
 
@@ -154,6 +155,14 @@ def cmd_delete(args, cfg) -> int:
         if input("delete this conversation? [y/N] ").strip().lower() not in ("y", "yes"):
             print("left alone")
             return 0
+    if pid and not args.keep_session and leftovers.is_own_ancestor(pid):
+        # Stopping the session that runs this command would stop this command too, before the transcript moves.
+        log = config_mod.data_dir() / "delete.log"
+        print(f"this command runs inside that session, so the delete finishes in the background; see {log}")
+        sys.stdout.flush()
+        if not leftovers.detach(log):
+            return 0
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "deleting", convo.session_id)
     if label and not args.keep_tab:
         print(ide.close_tab_quietly(convo.session_id, convo.project_path, cfg))
     if not args.keep_session:
